@@ -37,6 +37,7 @@ class SlicedData(object):
         self.inference = inference
         # if inference is True, the sliced data of weight keeps the conductance of G
         self.G = None
+        self.G_indices = None  # compressed uint8 level indices (4x smaller than float32 G)
         self.paral_size = paral_size
         if quant_gran is None:
             self.quant_gran = paral_size
@@ -80,7 +81,10 @@ class SlicedData(object):
         copy_ = copy.deepcopy(self)
         copy_.max_data = self.max_data.transpose(0,1)
         if self.is_weight:
-            copy_.G = self.G.transpose(-4, -5)
+            if self.G is not None:
+                copy_.G = self.G.transpose(-4, -5)
+            if self.G_indices is not None:
+                copy_.G_indices = self.G_indices.transpose(-4, -5)
         if self.inference:
             copy_.sliced_data = None
             copy_.quantized_data = None
@@ -92,6 +96,33 @@ class SlicedData(object):
     def size(self):
         return self.quantized_data.size()
 
+    def compress_G(self, engine):
+        """Compress float32 G to uint8 level indices for memory-efficient inference.
+        
+        ~4x memory savings (float32 → uint8). Only valid when engine.write_variation == 0,
+        because write variation adds continuous noise that cannot be losslessly compressed.
+        Stuck faults are handled correctly (they map to level 0 or g_level-1).
+        
+        Uses in-place operations to minimize peak memory during compression.
+        Peak = G (float32) + G_indices (uint8) ≈ 1.25x of G.
+        
+        Args:
+            engine: DPETensor engine with conductance parameters.
+        """
+        if self.G is None:
+            return
+        # In-place conversion: G → level indices (reuses G's memory)
+        self.G.sub_(engine.LGS)            # G = G - LGS
+        self.G.div_(engine.Q_G)            # G = (G - LGS) / Q_G → level index (float)
+        self.G.round_()                     # round to nearest integer level
+        self.G.clamp_(0, engine.g_level - 1)  # clamp to valid range
+        # Convert to compact integer type (new allocation, but much smaller)
+        if engine.g_level <= 256:
+            self.G_indices = self.G.to(torch.uint8)
+        else:
+            self.G_indices = self.G.to(torch.int16)
+        self.G = None  # free float32 tensor
+
     def slice_data_imp(self, engine, data):
         """
         implement the localized slicing of the data, and apply mapping
@@ -100,6 +131,15 @@ class SlicedData(object):
         :return:
         """
         data = data.to(engine.device)
+        # Synchronize all internal tensors to the computation device.
+        # This handles the case where the model is on a different device than the engine
+        # (e.g., model on cuda:1 but engine on cuda:0).
+        compute_device = data.device
+        if self.slice_method.device != compute_device:
+            self.slice_method = self.slice_method.to(compute_device)
+            self.sliced_max_weights = self.sliced_max_weights.to(compute_device)
+            self.sliced_weights = self.sliced_weights.to(compute_device)
+            self.device = compute_device
         self._slice_data(data)
         self.shape = data.shape
         if self.is_weight:

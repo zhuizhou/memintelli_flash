@@ -112,7 +112,7 @@ def evaluate(model, test_loader, device):
     
 def main():
     # Configuration
-    data_root = "/dataset/imagenet"   # Change this to your dataset directory
+    data_root = "/data/dataset/imagenet"   # Change this to your dataset directory
     batch_size = 2
     # Slicing configuration and INT/FP mode settings
     input_slice = (1, 1, 2, 2)

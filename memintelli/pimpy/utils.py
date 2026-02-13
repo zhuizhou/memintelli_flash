@@ -70,8 +70,8 @@ def quant_map_tensor(mat, blk, max_abs_temp_mat=None, skip_quantized=False):
 
     matq = torch.round(mat / max_mat * (2 ** (bits - 1) - 1)).int()
     mat_data = None if skip_quantized else (matq / (2 ** (bits - 1) - 1) * max_mat)
-    location = torch.where(matq < 0)
-    matq[location] = 2 ** bits + matq[location]
+    # Convert to two's complement: bitwise AND is zero-extra-memory (replaces torch.where + fancy index)
+    matq.bitwise_and_(2 ** bits - 1)
 
     data_int = torch.empty((mat.shape[0], mat.shape[1], mat.shape[2], len(blk), mat.shape[3], mat.shape[4]),
                            device=mat.device, dtype=quant_data_type)
@@ -115,8 +115,9 @@ def bfp_map_tensor(mat, blk, max_abs_temp_mat=None, skip_quantized=False):
     clip_down = (-2 ** (bits - 1)).to(mat.device)
     matq = torch.clip(matq, clip_down, clip_up)  # round & clip，clip到-2^(bits-1) ~ 2^(bits-1)-1
     mat_data = None if skip_quantized else (matq * 2. ** (e_bias + 2 - bits))  # dequantized data for backward
-    location = torch.where(matq < 0)
-    matq[location] = 2. ** bits + matq[location]
+    # Convert to two's complement: bitwise AND is zero-extra-memory
+    matq = matq.int()  # ensure int type for bitwise op
+    matq.bitwise_and_(2 ** bits - 1)
 
     data_int = torch.empty((mat.shape[0], mat.shape[1], mat.shape[2], len(blk), mat.shape[3], mat.shape[4]),
                            device=mat.device, dtype=quant_data_type)
