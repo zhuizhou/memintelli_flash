@@ -12,6 +12,8 @@ from transformers import AutoTokenizer
 import os
 import sys
 from pathlib import Path
+
+from transformers.models import FalconConfig
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -54,30 +56,37 @@ def evaluate_token_ppl(model, tokenizer, text, device, max_length=1024, stride=5
         total_nll += nll_val
         total_tokens += trg_len
 
+        # Periodically release unused CUDA cache to prevent fragmentation growth.
+        # The caching allocator holds freed blocks; empty_cache() returns them to the driver.
+        if (i // stride) % 10 == 9:
+            torch.cuda.empty_cache()
+
     avg_nll = total_nll / max(total_tokens, 1)
     return math.exp(avg_nll)
 
 
 def main():
-    model_name = "Qwen/Qwen3-4B"
+    model_name = "meta-llama/Llama-3.2-3B"
+    # model_name = "Qwen/Qwen3-8B"
     mem_enabled = True
     max_length = 512
     stride = 512
 
-    input_slice = (1, 1, 2, 2)
-    weight_slice = (1, 1, 2, 2)
+    input_slice = (1, 1, 1, 1)
+    weight_slice = (1, 1, 1, 1)
     bw_e = None
 
     # Enable TF32 for faster float32 matmul on Ampere+ GPUs (RTX 3xxx/4xxx, A100, etc.)
     # This gives ~2-3x speedup for non-RRAM ops (attention, norms) with negligible precision loss.
     torch.set_float32_matmul_precision('high')
 
-    # Set True to enable streaming mode (CPU offloading of G data).
-    # Reduces GPU memory drastically but adds ~5-15ms overhead per layer per token.
-    # Recommended for large models (e.g. Qwen3-4B) or small GPUs (8-16GB).
-    streaming = True
+    # Streaming mode controls GPU↔CPU offloading of G data:
+    #   False:  ALL G on GPU (fastest, ~16GB for 4B)
+    #   True:   ALL G on CPU, load per-layer (slowest, ~3GB for 4B)  
+    #   "auto": Keep as many layers on GPU as memory allows, stream the rest (recommended)
+    streaming = "auto"
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     mem_engine = DPETensor(
         HGS=1e-5,
@@ -85,11 +94,11 @@ def main():
         write_variation=0.0,
         rate_stuck_HGS=0.00,
         rate_stuck_LGS=0.00,
-        read_variation=0.02,
+        read_variation=0.05,
         vnoise=0.0,
-        rdac=2**2,
-        g_level=2**2,
-        radc=2**12,
+        rdac=2**1,
+        g_level=2**1,
+        radc=2**6,
         device=device,  
         inference_chunk_size=32*1024*1024,
         # IMPORTANT: must match model device (e.g. cuda:0, cuda:1)
@@ -130,7 +139,7 @@ def main():
     if mem_enabled:
         # Process weights → G one layer at a time (minimal GPU peak memory).
         # streaming=True: only ONE layer's G on GPU at any time.
-        model.update_weight_and_prepare(streaming=streaming)
+        model.update_weight_and_prepare(streaming="auto_speed")
 
     # Move remaining params (embedding, norms, lm_head) to GPU.
     # After update_weight_and_prepare: LinearMem weights are freed (empty),

@@ -75,87 +75,209 @@ class Qwen3MemWrapper(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def update_weight_and_prepare(self, streaming: bool = False, free_weights: bool = True) -> None:
+    def update_weight_and_prepare(self, streaming=False, free_weights: bool = True,
+                                   gpu_memory_reserve: float = 4.0) -> None:
         """Combined update + prepare that minimizes peak GPU memory.
         
-        Processes each LinearMem layer sequentially:
-          1. Move weight from CPU to engine device (GPU) temporarily
-          2. Compute G from weights → compress to uint8
-          3. Free the weight immediately (back to empty CPU tensor)
-          4. Move bias and internal tensors to engine device
-          5. Optionally offload G to CPU (streaming mode)
-          6. Garbage collect before next layer
+        Architecture: 3-phase pipeline that NEVER accumulates G on GPU.
         
-        Because LinearMem weights are created on CPU during replacement,
-        only ONE layer's weight + G exists on GPU at any time. This enables
-        running models far larger than GPU memory:
+        Phase 1: For each layer sequentially:
+          weight(CPU) → GPU → compute G → compress → offload G to pinned CPU → free weight
+          Peak GPU = ONE layer's (weight + G + intermediates) at any time.
         
-        Peak GPU memory = embedding + norms + lm_head + ONE_layer_weight + ONE_layer_G
+        Phase 2: Decide strategy and selectively load G back to GPU:
+          - False:  load ALL G back to GPU (fastest inference)
+          - True:   keep ALL on CPU, stream per-layer (lowest memory)
+          - "auto": load as many as GPU allows, stream the rest (best tradeoff)
         
-        For Qwen3-8B streaming: peak ~2.5GB on 24GB GPU!
-        For Qwen3-4B streaming: peak ~1.5GB
+        Phase 3: Build async prefetch chain for streaming layers.
         
         Args:
-            streaming: If True, offload each layer's G data to CPU after processing.
+            streaming: False | True | "auto" (see above)
             free_weights: If True (default), free nn.Parameter weight data after G.
+            gpu_memory_reserve: GB reserved for activations when streaming="auto".
         """
         self.eval()
-        
         if not self.mem_enabled:
             return
 
         import gc
+        
+        # ─── Phase 1: Compute G for all layers, ALWAYS offload to CPU immediately ───
+        # This keeps peak GPU = ONE layer at a time, regardless of model size.
+        all_mem_layers = []
         layer_count = 0
+        engine_device = None
         for module in self.modules():
             if isinstance(module, LinearMem):
                 layer_count += 1
                 engine = module.engine
                 engine_device = engine.device
                 
-                # Set inference BEFORE update
                 module.weight_sliced.inference = True
                 module.inference_mode = True
-                
-                # update_weight() moves weight to engine device internally via
-                # self.weight.detach().t().to(self.engine.device)
-                # This works whether weight is on CPU or GPU.
                 module.update_weight()
                 
-                # Compress G to uint8 indices if possible
                 if engine.write_variation == 0:
                     module.weight_sliced.compress_G(engine)
                 
-                # Free original weight parameters → empty CPU tensor
                 if free_weights:
                     module.weight.data = torch.empty(0, device='cpu', dtype=module.weight.dtype)
                 
-                # Free training-only data
                 module.weight_sliced.quantized_data = None
                 module.weight_sliced.sliced_data = None
                 
-                # Move bias to engine device (if it was created on CPU)
                 if module.bias is not None and module.bias.device != engine_device:
                     module.bias.data = module.bias.data.to(engine_device)
-                
-                # Move slice method tensors to engine device
                 if module.input_slice_method.device != engine_device:
                     module.input_slice_method = module.input_slice_method.to(engine_device)
                 if module.weight_slice_method.device != engine_device:
                     module.weight_slice_method = module.weight_slice_method.to(engine_device)
                 
-                # Streaming: offload G data to CPU after processing
-                if streaming:
-                    module._streaming = True
-                    module._offload_to_cpu()
+                # CRITICAL: Always offload G to pinned CPU immediately after computing!
+                # Without this, G data from all processed layers would accumulate on GPU
+                # and cause OOM for models with many layers (e.g., 3B+ params).
+                module._offload_to_cpu()
                 
-                # Per-layer GC to keep peak memory low
+                all_mem_layers.append(module)
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
-        print(f"[Qwen3] Processed {layer_count} LinearMem layers"
-              f" ({'streaming' if streaming else 'GPU-resident'},"
-              f" weights {'freed' if free_weights else 'kept'})")
+        if not all_mem_layers:
+            return
+        
+        # ─── Phase 2: Decide streaming strategy and load GPU-resident layers ───
+        # All G is now on pinned CPU. Calculate sizes from pinned buffers.
+        layer_g_sizes = []
+        total_g_bytes = 0
+        for m in all_mem_layers:
+            sz = 0
+            for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
+                t = m._pinned_buffers.get(attr)
+                if t is not None:
+                    sz += t.nelement() * t.element_size()
+            layer_g_sizes.append(sz)
+            total_g_bytes += sz
+        
+        total_g_gb = total_g_bytes / 1024**3
+        
+        auto_mode = "auto_memory" if streaming == "auto" else streaming
+        if auto_mode in ("auto_memory", "auto_speed") and torch.cuda.is_available():
+            gpu_total = torch.cuda.get_device_properties(engine_device).total_memory
+            gpu_used = torch.cuda.memory_allocated(engine_device)
+            
+            # Account for non-LinearMem params that model.to(device) will add later
+            # (embedding, layer norms, lm_head if not simulated, etc.)
+            # After Phase 1: LinearMem weights are freed (numel=0), biases already on GPU.
+            # So any CPU param with numel>0 is a non-LinearMem param that will be moved.
+            pending_cpu_bytes = sum(
+                p.numel() * p.element_size()
+                for p in self.parameters()
+                if p.device.type == 'cpu' and p.numel() > 0
+            )
+            
+            gpu_budget = (gpu_total - gpu_used
+                          - int(gpu_memory_reserve * 1024**3)
+                          - pending_cpu_bytes)
+            budget_gb = gpu_budget / 1024**3
+            pending_gb = pending_cpu_bytes / 1024**3
+            print(f"[Qwen3] {auto_mode}: GPU {gpu_total/1024**3:.1f}GB total, "
+                  f"{gpu_used/1024**3:.1f}GB used, "
+                  f"{pending_gb:.1f}GB pending (embedding/norms), "
+                  f"{gpu_memory_reserve:.0f}GB reserved → "
+                  f"budget {budget_gb:.1f}GB for G")
+            
+            if total_g_bytes <= gpu_budget:
+                # All G fits — load everything back to GPU
+                streaming = False
+                print(f"[Qwen3] {auto_mode}: ALL G ({total_g_gb:.1f}GB) fits in GPU "
+                      f"(budget {budget_gb:.1f}GB) → GPU-resident (fastest)")
+            else:
+                # auto_memory: offload biggest layers first (maximize memory safety).
+                # auto_speed: offload smallest layers first (minimize transfer overhead).
+                indexed = sorted(
+                    range(len(layer_g_sizes)),
+                    key=lambda i: layer_g_sizes[i],
+                    reverse=(auto_mode == "auto_memory"),
+                )
+                need_to_offload = max(0, total_g_bytes - gpu_budget)
+                offloaded_bytes = 0
+                offload_set = set()
+                
+                for idx in indexed:
+                    if offloaded_bytes >= need_to_offload:
+                        break
+                    offload_set.add(idx)
+                    offloaded_bytes += layer_g_sizes[idx]
+                
+                # Post-check: ensure GPU has room for async prefetch double-buffer.
+                # During inference, the current streaming layer's G is on GPU while
+                # the next streaming layer is being prefetched — both coexist briefly.
+                # We must reserve room for the LARGEST streaming layer as prefetch buffer.
+                if offload_set:
+                    max_stream_size = max(layer_g_sizes[i] for i in offload_set)
+                    resident_bytes = total_g_bytes - offloaded_bytes
+                    # Keep offloading according to the selected auto policy until prefetch fits.
+                    while resident_bytes + max_stream_size > gpu_budget:
+                        resident_indices = [i for i in range(len(all_mem_layers))
+                                            if i not in offload_set]
+                        if not resident_indices:
+                            break
+                        selected = (
+                            max(resident_indices, key=lambda i: layer_g_sizes[i])
+                            if auto_mode == "auto_memory"
+                            else min(resident_indices, key=lambda i: layer_g_sizes[i])
+                        )
+                        offload_set.add(selected)
+                        offloaded_bytes += layer_g_sizes[selected]
+                        resident_bytes -= layer_g_sizes[selected]
+                        max_stream_size = max(layer_g_sizes[i] for i in offload_set)
+                
+                # Load GPU-resident layers, mark streaming layers
+                for i, m in enumerate(all_mem_layers):
+                    if i in offload_set:
+                        m._streaming = True
+                        # G already on pinned CPU, _pinned_buffers ready
+                    else:
+                        m._load_to_device(engine_device)
+                        m._pinned_buffers.clear()  # free pinned CPU copy
+                
+                resident_count = layer_count - len(offload_set)
+                resident_gb = (total_g_bytes - offloaded_bytes) / 1024**3
+                print(f"[Qwen3] {auto_mode}: G {total_g_gb:.1f}GB > budget {budget_gb:.1f}GB → "
+                      f"partial: {resident_count} GPU-resident ({resident_gb:.1f}GB), "
+                      f"{len(offload_set)} streaming ({offloaded_bytes/1024**3:.1f}GB)")
+                streaming = "partial_done"
+        
+        if streaming is False:
+            # Load ALL G back from pinned CPU to GPU
+            for m in all_mem_layers:
+                m._load_to_device(engine_device)
+                m._pinned_buffers.clear()
+            print(f"[Qwen3] Processed {layer_count} layers → GPU-resident "
+                  f"({total_g_gb:.1f}GB G on GPU, weights {'freed' if free_weights else 'kept'})")
+        elif streaming is True:
+            # All stay on pinned CPU
+            for m in all_mem_layers:
+                m._streaming = True
+            print(f"[Qwen3] Processed {layer_count} layers → full streaming "
+                  f"({total_g_gb:.1f}GB G on CPU, weights {'freed' if free_weights else 'kept'})")
+        # "partial_done" case already printed above
+        
+        # ─── Phase 3: Build async prefetch chain for streaming layers ───
+        # Each streaming layer's forward() triggers async H2D for the next one,
+        # overlapping PCIe transfers with GPU computation (attention, norms, etc.)
+        streaming_layers = [m for m in all_mem_layers if m._streaming]
+        if streaming_layers:
+            for i in range(len(streaming_layers) - 1):
+                # MUST use object.__setattr__ to bypass nn.Module.__setattr__!
+                # PyTorch auto-registers Module attributes as submodules, which would
+                # create a circular module tree and cause RecursionError in .to()
+                object.__setattr__(streaming_layers[i], '_next_streaming_layer', streaming_layers[i + 1])
+            # Circular: last layer prefetches first for next forward pass
+            object.__setattr__(streaming_layers[-1], '_next_streaming_layer', streaming_layers[0])
+            print(f"[Qwen3] Async prefetch chain: {len(streaming_layers)} streaming layers linked")
 
     def enable_streaming(self) -> None:
         """Enable streaming mode: offload all layer G data to CPU, load on-demand.
@@ -304,6 +426,6 @@ def qwen3_zoo(
         }
         _replace_linear_with_linearmem(model, mem_args, skip_modules=skip_modules)
         if skip_modules:
-            print(f"[Qwen3] Skipped RRAM simulation for: {skip_modules} (using standard nn.Linear)")
+            print(f" Skipped RRAM simulation for: {skip_modules} (using standard nn.Linear)")
 
     return Qwen3MemWrapper(model=model, mem_enabled=mem_enabled)

@@ -112,15 +112,18 @@ def evaluate(model, test_loader, device):
     
 def main():
     # Configuration
-    data_root = "D:/dataset/imagenet"   # Change this to your dataset directory
+    data_root = "/data/dataset/imagenet"   # Change this to your dataset directory
     batch_size = 64
     # Slicing configuration and INT/FP mode settings
     input_slice = (1, 1, 2, 2)
     weight_slice = (1, 1, 2, 2)
     bw_e = None
-
-    model_name = 'resnet152'     # Select the model name
-    mem_enabled = True          # Select the memrsitive mode or software mode
+    torch.set_float32_matmul_precision('high')
+    # Streaming mode: False (all GPU), True (all CPU), "auto" (recommended)
+    # For ResNet18 (~5GB G), "auto" will likely keep all on GPU for max speed.
+    streaming = "auto"
+    model_name = 'resnet18'     # Select the model name
+    mem_enabled = True          # Select the memristive mode or software mode
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = load_dataset(data_root, batch_size)
@@ -135,14 +138,17 @@ def main():
         vnoise=0.0,                   # Random Gaussian noise of voltage
         rdac=2**2,                      # Number of DAC resolution 
         g_level=2**2,                   # Number of conductance levels
-        radc=2**12
+        radc=2**12,
+        device=device,                   # IMPORTANT: must match model device
+        inference_chunk_size=32*1024*1024,  # Controls peak memory during inference matmul
         )
-
+    
     model = ResNet_zoo(model_name=model_name, pretrained=True, mem_enabled=mem_enabled, 
-    engine = mem_engine, input_slice=input_slice, weight_slice=weight_slice, device=device, bw_e=bw_e,
-    input_paral_size=(1, 32), weight_paral_size=(32, 32), input_quant_gran=(1, 64), weight_quant_gran=(64, 64)).to(device)
-    model.update_weight()
-    model.prepare_for_inference()  # Enable optimized inference (memory-efficient, faster)
+        engine=mem_engine, input_slice=input_slice, weight_slice=weight_slice, device=device, bw_e=bw_e,
+        input_paral_size=(1, 32), weight_paral_size=(32, 32), 
+        input_quant_gran=(1, 64), weight_quant_gran=(64, 64)).to(device)
+    if mem_enabled:
+        model.update_weight_and_prepare(streaming=streaming)  # Combined: update G + compress + prepare for inference
     final_acc = evaluate(model, test_loader, device)
     print(f"\nFinal test accuracy of {model_name} in Imagenet: {final_acc:.2%}")
 

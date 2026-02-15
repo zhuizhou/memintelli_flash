@@ -1,248 +1,181 @@
 # -*- coding:utf-8 -*-
-# @File  : Mobilnetv2.py
-# @Author: Zhou
-# @Date  : 2025/10/16
+# @File  : VGG.py
+# @Author: ZZW
+# @Date  : 2025/02/20
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Union, List, Dict, Any, Optional
-from torch.hub import load_state_dict_from_url
+from typing import Union, List, Dict, Any, cast, Optional
 from memintelli.NN_layers import Conv2dMem, LinearMem
 
-# Pretrained model URLs
-model_urls = {
-    'mobilenet_v2': 'https://github.com/HUST-ISMD-Odyssey/MemIntelli/releases/download/pretrained_model/mobilenetv2_1.0-0c6065bc.pth'
+# timm model names on HuggingFace (timm/xxx)
+timm_model_names: Dict[str, str] = {
+    'vgg11': 'vgg11.tv_in1k',
+    'vgg13': 'vgg13.tv_in1k',
+    'vgg16': 'vgg16.tv_in1k',
+    'vgg19': 'vgg19.tv_in1k',
+    'vgg11_bn': 'vgg11_bn.tv_in1k',
+    'vgg13_bn': 'vgg13_bn.tv_in1k',
+    'vgg16_bn': 'vgg16_bn.tv_in1k',
+    'vgg19_bn': 'vgg19_bn.tv_in1k',
 }
 
 
-class InvertedResidual(nn.Module):
+def _load_timm_pretrained(model: nn.Module, model_name: str) -> None:
+    """Load pretrained weights from timm (HuggingFace: timm/xxx).
+
+    timm VGG uses Conv2d-based ConvMlp for pre_logits and ClassifierHead for head,
+    so we need to remap keys and reshape classifier weights (Conv2d → Linear).
+
+    timm state_dict key mapping:
+        pre_logits.fc1  →  classifier.0   (Conv2d [out, in, 7, 7] → Linear [out, in*7*7])
+        pre_logits.fc2  →  classifier.3   (Conv2d [out, in, 1, 1] → Linear [out, in])
+        head.fc         →  classifier.6   (Linear, same shape)
+        features.*      →  features.*     (same)
     """
-    Inverted Residual block with optional memristive layers
-    
+    import timm
+
+    timm_name = timm_model_names[model_name]
+    timm_model = timm.create_model(timm_name, pretrained=True)
+    timm_sd = timm_model.state_dict()
+
+    new_sd = {}
+    for k, v in timm_sd.items():
+        if k.startswith('features.'):
+            new_sd[k] = v
+        elif k.startswith('pre_logits.fc1'):
+            new_key = k.replace('pre_logits.fc1', 'classifier.0')
+            if 'weight' in k:
+                # Conv2d weight [out_ch, in_ch, 7, 7] → Linear weight [out_ch, in_ch*7*7]
+                v = v.reshape(v.shape[0], -1)
+            new_sd[new_key] = v
+        elif k.startswith('pre_logits.fc2'):
+            new_key = k.replace('pre_logits.fc2', 'classifier.3')
+            if 'weight' in k:
+                # Conv2d weight [out_ch, in_ch, 1, 1] → Linear weight [out_ch, in_ch]
+                v = v.reshape(v.shape[0], -1)
+            new_sd[new_key] = v
+        elif k.startswith('head.fc'):
+            new_key = k.replace('head.fc', 'classifier.6')
+            new_sd[new_key] = v
+        # skip other timm-specific keys (e.g. head.flatten, etc.)
+
+    model.load_state_dict(new_sd)
+    del timm_model, timm_sd
+    print(f"[VGG] Loaded pretrained weights from timm/{timm_name}")
+
+# Configuration for different VGG architectures
+cfgs: Dict[str, List[Union[str, int]]] = {
+    'vgg11': [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
+    'vgg13': [64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
+    'vgg16': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M'],
+    'vgg19': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512, 'M'],
+}
+
+
+class VGG(nn.Module):
+    """
+    Unified VGG model for ImageNet with optional memristive mode.
+
     Args:
-        inp (int): Number of input channels
-        oup (int): Number of output channels
-        stride (int): Stride for depthwise convolution
-        expand_ratio (int): Expansion ratio for hidden dimension
-        mem_enabled (bool): Enable memristive layers
-        mem_args (Optional[Dict[str, Any]]): Dictionary containing memristive parameters
-    """
-    def __init__(
-        self,
-        inp: int,
-        oup: int,
-        stride: int,
-        expand_ratio: int,
-        mem_enabled: bool = False,
-        mem_args: Optional[Dict[str, Any]] = None
-    ):
-        super().__init__()
-        self.stride = stride
-        assert stride in [1, 2]
-
-        hidden_dim = int(round(inp * expand_ratio))
-        self.use_res_connect = self.stride == 1 and inp == oup
-
-        self.mem_enabled = mem_enabled
-        self.mem_args = mem_args if self.mem_enabled else {}
-
-        layers = []
-        conv_layer = Conv2dMem if mem_enabled else nn.Conv2d
-        
-        if expand_ratio != 1:
-            # Pointwise expansion
-            if mem_enabled:
-                layers.append(conv_layer(
-                    in_channels=inp, out_channels=hidden_dim, kernel_size=1,
-                    stride=1, padding=0, bias=False, **self.mem_args
-                ))
-            else:
-                layers.append(nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False))
-            layers.append(nn.BatchNorm2d(hidden_dim))
-            layers.append(nn.ReLU6(inplace=True))
-        
-        # Depthwise convolution - always use standard conv with groups
-        layers.append(nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False))
-        layers.append(nn.BatchNorm2d(hidden_dim))
-        layers.append(nn.ReLU6(inplace=True))
-        
-        # Pointwise linear projection
-        if mem_enabled:
-            layers.append(conv_layer(
-                in_channels=hidden_dim, out_channels=oup, kernel_size=1,
-                stride=1, padding=0, bias=False, **self.mem_args
-            ))
-        else:
-            layers.append(nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False))
-        layers.append(nn.BatchNorm2d(oup))
-        
-        self.conv = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_res_connect:
-            return x + self.conv(x)
-        else:
-            return self.conv(x)
-
-
-class MobileNetV2(nn.Module):
-    """
-    MobileNetV2 model with optional memristive mode
-    
-    Args:
+        cfg (str): Architecture configuration key (e.g. 'vgg16', 'vgg16_bn')
         num_classes (int): Number of output classes
-        width_mult (float): Width multiplier for channel dimensions
-        inverted_residual_setting (Optional[List[List[int]]]): Network structure configuration
-        round_nearest (int): Round the number of channels to the nearest multiple of this number
-        mem_enabled (bool): Enable memristive layers
-        mem_args (Optional[Dict[str, Any]]): Dictionary containing memristive parameters
+        batch_norm (bool): Whether to use batch normalization
+        mem_enabled (bool): If True, use memristive engine layers
+        mem_args: Dictionary containing memristive parameters
     """
     def __init__(
         self,
+        cfg: str = 'vgg16',
         num_classes: int = 1000,
-        width_mult: float = 1.0,
-        inverted_residual_setting: Optional[List[List[int]]] = None,
-        round_nearest: int = 8,
-        mem_enabled: bool = False,
+        batch_norm: bool = False,
+        mem_enabled: bool = True,
         mem_args: Optional[Dict[str, Any]] = None
     ):
         super().__init__()
-
         self.mem_enabled = mem_enabled
         self.mem_args = mem_args if self.mem_enabled else {}
+        self.batch_norm = batch_norm
 
-        block = InvertedResidual
-        input_channel = 32
-        last_channel = 1280
-
-        if inverted_residual_setting is None:
-            # t: expansion factor, c: output channels, n: number of blocks, s: stride
-            inverted_residual_setting = [
-                # t, c, n, s
-                [1, 16, 1, 1],
-                [6, 24, 2, 2],
-                [6, 32, 3, 2],
-                [6, 64, 4, 2],
-                [6, 96, 3, 1],
-                [6, 160, 3, 2],
-                [6, 320, 1, 1],
-            ]
-
-        # Only check the first element, assuming user knows what they are doing
-        if len(inverted_residual_setting) == 0 or len(inverted_residual_setting[0]) != 4:
-            raise ValueError("inverted_residual_setting should be non-empty "
-                           "or a 4-element list, got {}".format(inverted_residual_setting))
-
-        # Building first layer
-        input_channel = self._make_divisible(input_channel * width_mult, round_nearest)
-        self.last_channel = self._make_divisible(last_channel * max(1.0, width_mult), round_nearest)
-        
-        # First conv layer - wrap in Sequential to match pretrained model structure
-        conv_layer = Conv2dMem if mem_enabled else nn.Conv2d
-        features = []
-        
-        # Add first conv layer wrapped in Sequential (features.0)
-        first_conv_layers = []
-        if mem_enabled:
-            first_conv_layers.append(conv_layer(
-                in_channels=3, out_channels=input_channel, kernel_size=3,
-                stride=2, padding=1, bias=False, **self.mem_args
-            ))
-        else:
-            first_conv_layers.append(nn.Conv2d(3, input_channel, 3, 2, 1, bias=False))
-        first_conv_layers.append(nn.BatchNorm2d(input_channel))
-        first_conv_layers.append(nn.ReLU6(inplace=True))
-        features.append(nn.Sequential(*first_conv_layers))
-
-        # Building inverted residual blocks
-        for t, c, n, s in inverted_residual_setting:
-            output_channel = self._make_divisible(c * width_mult, round_nearest)
-            for i in range(n):
-                stride = s if i == 0 else 1
-                features.append(block(
-                    input_channel, output_channel, stride, expand_ratio=t,
-                    mem_enabled=mem_enabled, mem_args=mem_args
-                ))
-                input_channel = output_channel
-
-        # Make it nn.Sequential (without last conv layer)
-        self.features = nn.Sequential(*features)
-        
-        # Building last conv layer as a separate Sequential to match pretrained model structure
-        last_conv_layers = []
-        if mem_enabled:
-            last_conv_layers.append(conv_layer(
-                in_channels=input_channel, out_channels=self.last_channel, kernel_size=1,
-                stride=1, padding=0, bias=False, **self.mem_args
-            ))
-        else:
-            last_conv_layers.append(nn.Conv2d(input_channel, self.last_channel, 1, 1, 0, bias=False))
-        last_conv_layers.append(nn.BatchNorm2d(self.last_channel))
-        last_conv_layers.append(nn.ReLU6(inplace=True))
-        self.conv = nn.Sequential(*last_conv_layers)
-
-        # Building classifier - match pretrained model structure (no Sequential wrapper for compatibility)
-        # For standard mode without Sequential, dropout is handled separately
-        self.dropout = nn.Dropout(0.2)
-        linear_layer = LinearMem if mem_enabled else nn.Linear
-        if mem_enabled:
-            self.classifier = linear_layer(
-                in_features=self.last_channel, out_features=num_classes,
-                **self.mem_args
-            )
-        else:
-            self.classifier = nn.Linear(self.last_channel, num_classes)
+        self.features = self._make_layers(cfgs[cfg])
+        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
+        self.classifier = self._make_classifier(num_classes)
 
         # Weight initialization
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, Conv2dMem)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out')
-                if hasattr(m, 'bias') and m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
             elif isinstance(m, (nn.Linear, LinearMem)):
                 nn.init.normal_(m.weight, 0, 0.01)
-                if hasattr(m, 'bias') and m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                nn.init.constant_(m.bias, 0)
 
-    def _make_divisible(self, v: float, divisor: int, min_value: Optional[int] = None) -> int:
-        """
-        This function ensures that all layers have a channel number that is divisible by 8
-        It can be seen at: https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
-        """
-        if min_value is None:
-            min_value = divisor
-        new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
-        # Make sure that round down does not go down by more than 10%
-        if new_v < 0.9 * v:
-            new_v += divisor
-        return new_v
+    def _make_layers(self, cfg: List[Union[str, int]]) -> nn.Sequential:
+        """Construct feature extraction layers."""
+        layers = []
+        in_channels = 3
+
+        for v in cfg:
+            if v == 'M':
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            else:
+                v = cast(int, v)
+                if self.mem_enabled:
+                    conv_layer = Conv2dMem(
+                        **self.mem_args, in_channels=in_channels, out_channels=v,
+                        kernel_size=3, padding=1, skip_initial_mapping=True
+                    )
+                else:
+                    conv_layer = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+
+                if self.batch_norm:
+                    layers.extend([conv_layer, nn.BatchNorm2d(v), nn.ReLU(inplace=True)])
+                else:
+                    layers.extend([conv_layer, nn.ReLU(inplace=True)])
+
+                in_channels = v
+
+        return nn.Sequential(*layers)
+
+    def _make_classifier(self, num_classes: int) -> nn.Sequential:
+        """Construct classification head (ImageNet-style with 4096 hidden units)."""
+        linear = LinearMem if self.mem_enabled else nn.Linear
+        mem_args = self.mem_args if self.mem_enabled else {}
+        # Add skip_initial_mapping for LinearMem to avoid computing G from random weights
+        if self.mem_enabled:
+            mem_args = {**mem_args, 'skip_initial_mapping': True}
+
+        return nn.Sequential(
+            linear(in_features=512 * 7 * 7, out_features=4096, **mem_args),
+            nn.ReLU(True),
+            nn.Dropout(),
+            linear(in_features=4096, out_features=4096, **mem_args),
+            nn.ReLU(True),
+            nn.Dropout(),
+            linear(in_features=4096, out_features=num_classes, **mem_args),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass implementation."""
         x = self.features(x)
-        x = self.conv(x)
-        # Cannot use "squeeze" as batch-size can be 1
-        x = nn.functional.adaptive_avg_pool2d(x, (1, 1))
+        x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        x = self.dropout(x)
         x = self.classifier(x)
         return x
 
     def update_weight(self) -> None:
-        """Update weights for memristive layers (if enabled)"""
+        """Update weights for memristive layers (if enabled)."""
         if not self.mem_enabled:
             return
 
         for module in self.modules():
             if isinstance(module, (Conv2dMem, LinearMem)):
                 module.update_weight()
-    
-    
-
-
 
     def prepare_for_inference(self) -> None:
         """Prepare the model for optimized inference.
@@ -253,6 +186,7 @@ class MobileNetV2(nn.Module):
         self.eval()
         if not self.mem_enabled:
             return
+
         import gc
         for module in self.modules():
             if isinstance(module, (Conv2dMem, LinearMem)):
@@ -275,6 +209,7 @@ class MobileNetV2(nn.Module):
         
         Phase 1: For each layer sequentially:
           weight → GPU → compute G → compress → offload G to pinned CPU → free weight
+          Peak GPU = ONE layer's (weight + G + intermediates) at any time.
         
         Phase 2: Decide strategy and selectively load G back to GPU:
           - False:  load ALL G back to GPU (fastest inference)
@@ -282,6 +217,11 @@ class MobileNetV2(nn.Module):
           - "auto": load as many as GPU allows, stream the rest (best tradeoff)
         
         Phase 3: Build async prefetch chain for streaming layers.
+        
+        Args:
+            streaming: False | True | "auto" (see above)
+            free_weights: If True (default), free nn.Parameter weight data after G.
+            gpu_memory_reserve: GB reserved for activations when streaming="auto".
         """
         self.eval()
         if not self.mem_enabled:
@@ -319,6 +259,7 @@ class MobileNetV2(nn.Module):
                 if module.weight_slice_method.device != engine_device:
                     module.weight_slice_method = module.weight_slice_method.to(engine_device)
                 
+                # CRITICAL: Always offload G to pinned CPU immediately after computing!
                 module._offload_to_cpu()
                 
                 all_mem_layers.append(module)
@@ -356,14 +297,16 @@ class MobileNetV2(nn.Module):
                           - int(gpu_memory_reserve * 1024**3)
                           - pending_cpu_bytes)
             budget_gb = gpu_budget / 1024**3
-            print(f"[MobileNetV2] {auto_mode}: GPU {gpu_total/1024**3:.1f}GB total, "
+            pending_gb = pending_cpu_bytes / 1024**3
+            print(f"[VGG] {auto_mode}: GPU {gpu_total/1024**3:.1f}GB total, "
                   f"{gpu_used/1024**3:.1f}GB used, "
+                  f"{pending_gb:.1f}GB pending, "
                   f"{gpu_memory_reserve:.0f}GB reserved → "
                   f"budget {budget_gb:.1f}GB for G")
             
             if total_g_bytes <= gpu_budget:
                 streaming = False
-                print(f"[MobileNetV2] {auto_mode}: ALL G ({total_g_gb:.1f}GB) fits → GPU-resident")
+                print(f"[VGG] {auto_mode}: ALL G ({total_g_gb:.1f}GB) fits → GPU-resident (fastest)")
             else:
                 indexed = sorted(
                     range(len(layer_g_sizes)),
@@ -405,20 +348,21 @@ class MobileNetV2(nn.Module):
                         m._pinned_buffers.clear()
                 
                 resident_count = layer_count - len(offload_set)
-                print(f"[MobileNetV2] {auto_mode}: partial: {resident_count} GPU-resident, "
-                      f"{len(offload_set)} streaming")
+                resident_gb = (total_g_bytes - offloaded_bytes) / 1024**3
+                print(f"[VGG] {auto_mode}: partial: {resident_count} GPU-resident ({resident_gb:.1f}GB), "
+                      f"{len(offload_set)} streaming ({offloaded_bytes/1024**3:.1f}GB)")
                 streaming = "partial_done"
         
         if streaming is False:
             for m in all_mem_layers:
                 m._load_to_device(engine_device)
                 m._pinned_buffers.clear()
-            print(f"[MobileNetV2] Processed {layer_count} layers → GPU-resident "
+            print(f"[VGG] Processed {layer_count} layers → GPU-resident "
                   f"({total_g_gb:.1f}GB G on GPU, weights {'freed' if free_weights else 'kept'})")
         elif streaming is True:
             for m in all_mem_layers:
                 m._streaming = True
-            print(f"[MobileNetV2] Processed {layer_count} layers → full streaming "
+            print(f"[VGG] Processed {layer_count} layers → full streaming "
                   f"({total_g_gb:.1f}GB G on CPU, weights {'freed' if free_weights else 'kept'})")
         
         # ─── Phase 3: Build async prefetch chain for streaming layers ───
@@ -427,11 +371,12 @@ class MobileNetV2(nn.Module):
             for i in range(len(streaming_layers) - 1):
                 object.__setattr__(streaming_layers[i], '_next_streaming_layer', streaming_layers[i + 1])
             object.__setattr__(streaming_layers[-1], '_next_streaming_layer', streaming_layers[0])
-            print(f"[MobileNetV2] Async prefetch chain: {len(streaming_layers)} streaming layers linked")
-def MobileNetV2_zoo(
-    model_name: str = 'mobilenet_v2',
+            print(f"[VGG] Async prefetch chain: {len(streaming_layers)} streaming layers linked")
+
+
+def VGG_zoo(
+    model_name: str = 'vgg16',
     num_classes: int = 1000,
-    width_mult: float = 1.0,
     pretrained: bool = False,
     mem_enabled: bool = False,
     engine: Optional[Any] = None,
@@ -443,38 +388,24 @@ def MobileNetV2_zoo(
     weight_paral_size: Optional[Union[torch.Tensor, list]] = (32, 32),
     input_quant_gran: Optional[Union[torch.Tensor, list]] = (1, 64),
     weight_quant_gran: Optional[Union[torch.Tensor, list]] = (64, 64)
-) -> MobileNetV2:
+) -> VGG:
     """
-    MobileNetV2 model factory
-    
+    VGG model factory for ImageNet.
+
     Args:
-        model_name (str): Model architecture name (currently only 'mobilenet_v2')
+        model_name (str): Model architecture name (e.g. 'vgg16', 'vgg16_bn')
         num_classes (int): Number of output classes
-        width_mult (float): Width multiplier for channel dimensions (default: 1.0)
         pretrained (bool): Load pretrained weights
         mem_enabled (bool): Enable memristive mode
         engine (Optional[Any]): Memory engine for Mem layers
         input_slice (Optional[torch.Tensor, list]): Input tensor slicing configuration
         weight_slice (Optional[torch.Tensor, list]): Weight tensor slicing configuration
         device (Optional[Any]): Computation device (CPU/GPU)
-        bw_e (Optional[Any]): If bw_e is None, the memristive engine is INT mode, 
-                             otherwise, the memristive engine is FP mode (bw_e is the bitwidth of the exponent)
-        input_paral_size (Optional[torch.Tensor, list]): Input parallelization size
-        weight_paral_size (Optional[torch.Tensor, list]): Weight parallelization size
-        input_quant_gran (Optional[torch.Tensor, list]): Input quantization granularity
-        weight_quant_gran (Optional[torch.Tensor, list]): Weight quantization granularity
-    
+        bw_e (Optional[Any]): if bw_e is None, the memristive engine is INT mode,
+            otherwise, the memristive engine is FP mode (bw_e is the bitwidth of the exponent)
+
     Returns:
-        MobileNetV2: Configured MobileNetV2 model
-    
-    Example:
-        >>> # Standard PyTorch model
-        >>> model = MobileNetV2_zoo('mobilenet_v2', num_classes=1000, pretrained=True)
-        >>> 
-        >>> # Memristive model
-        >>> from memintelli.pimpy import MemIntelli
-        >>> engine = MemIntelli(device='cuda')
-        >>> model = MobileNetV2_zoo('mobilenet_v2', num_classes=1000, mem_enabled=True, engine=engine)
+        VGG: Configured VGG model instance
     """
     mem_args = {
         "engine": engine,
@@ -485,22 +416,26 @@ def MobileNetV2_zoo(
         "input_paral_size": input_paral_size,
         "weight_paral_size": weight_paral_size,
         "input_quant_gran": input_quant_gran,
-        "weight_quant_gran": weight_quant_gran,
-        "skip_initial_mapping": True,
+        "weight_quant_gran": weight_quant_gran
     } if mem_enabled else {}
 
-    if model_name not in model_urls:
-        raise ValueError(f"Invalid model name: {model_name}. Available: {list(model_urls.keys())}")
+    if model_name not in timm_model_names:
+        raise ValueError(f"Invalid model name: {model_name}. "
+                         f"Choose from {list(timm_model_names.keys())}")
 
-    model = MobileNetV2(
+    # Determine base config and whether to use batch norm
+    batch_norm = model_name.endswith('_bn')
+    base_cfg = model_name.replace('_bn', '') if batch_norm else model_name
+
+    model = VGG(
+        cfg=base_cfg,
         num_classes=num_classes,
-        width_mult=width_mult,
+        batch_norm=batch_norm,
         mem_enabled=mem_enabled,
         mem_args=mem_args
     )
 
     if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[model_name], progress=True)
-        model.load_state_dict(state_dict)
+        _load_timm_pretrained(model, model_name)
 
     return model

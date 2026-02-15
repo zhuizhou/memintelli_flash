@@ -96,7 +96,7 @@ def evaluate(model, test_loader, device):
     correct = 0
     total = 0
     
-    with torch.no_grad():
+    with torch.inference_mode():
         progress_bar = tqdm(test_loader, desc="Evaluating", unit="batch")
         for images, labels in progress_bar:
             images, labels = images.to(device), labels.to(device)
@@ -113,14 +113,17 @@ def evaluate(model, test_loader, device):
 def main():
     # Configuration
     data_root = "/data/dataset/imagenet"   # Change this to your dataset directory
-    batch_size = 2
+    batch_size = 64
     # Slicing configuration and INT/FP mode settings
     input_slice = (1, 1, 2, 2)
     weight_slice = (1, 1, 2, 2)
     bw_e = None
 
+    # Enable TF32 for faster float32 matmul on Ampere+ GPUs
+    torch.set_float32_matmul_precision('high')
+
     model_name = 'deit_base_patch16_224'     # Select the model name
-    mem_enabled = True          # Select the memrsitive mode or software mode
+    mem_enabled = True          # Select the memristive mode or software mode
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = load_dataset(data_root, batch_size)
@@ -135,14 +138,16 @@ def main():
         vnoise=0.0,                   # Random Gaussian noise of voltage
         rdac=2**2,                      # Number of DAC resolution 
         g_level=2**2,                   # Number of conductance levels
-        radc=2**16
+        radc=2**12,                     # 2**16 → 2**12 (sufficient precision, faster)
+        device=device,                   # IMPORTANT: must match model device
+        inference_chunk_size=256*1024*1024,  # Controls peak memory during inference matmul
         )
     if mem_enabled:
         model = deit_zoo(model_name=model_name, pretrained=True, mem_enabled=mem_enabled, 
-            engine = mem_engine, input_slice=input_slice, weight_slice=weight_slice, device=device, bw_e=bw_e,
-            input_paral_size=(1, 128), weight_paral_size=(128, 1), input_quant_gran=(1, 128), weight_quant_gran=(128, 1)).to(device)
-        model.update_weight()
-        model.prepare_for_inference()  # Enable optimized inference (memory-efficient, faster)
+            engine=mem_engine, input_slice=input_slice, weight_slice=weight_slice, device=device, bw_e=bw_e,
+            input_paral_size=(1, 64), weight_paral_size=(64, 1), 
+            input_quant_gran=(1, 64), weight_quant_gran=(64, 1)).to(device)
+        model.update_weight_and_prepare(streaming=False)  # Combined: update G + compress + prepare for inference
     else:
         model = deit_zoo(model_name=model_name, pretrained=True).to(device)
     final_acc = evaluate(model, test_loader, device)
