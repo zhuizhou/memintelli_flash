@@ -251,6 +251,7 @@ def build_engine(args: argparse.Namespace, device: torch.device) -> DPETensorMul
         triton_block_l=args.triton_block_l,
         triton_block_k=args.triton_block_k,
         triton_output_chunk_limit=args.triton_output_chunk_limit,
+        triton_auto_config=args.triton_auto_config,
         triton_gidx_fuse_input_slices=True,
         triton_reuse_input_voltage=True,
         triton_gidx_direct_final_output=True,
@@ -390,7 +391,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--triton-block-l", type=int, default=16)
     parser.add_argument("--triton-block-k", type=int, default=64)
     parser.add_argument("--triton-output-chunk-limit", type=int, default=256)
-    parser.add_argument("--mode1-input-tile-group", type=int, default=4)
+    parser.add_argument("--triton-auto-config", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mode1-input-tile-group", type=int, default=1)
     parser.add_argument("--chunk-mb", type=float, default=64.0)
     parser.add_argument("--execution-reserve-gb", type=float, default=4.0)
     parser.add_argument("--pin-policy", choices=["persistent", "window"], default="persistent")

@@ -39,6 +39,25 @@ use `--linearmem-device engine --execution speed` to create replacement
 `LinearMem` parameters directly on the engine device and keep prepared
 conductance/index tensors resident on GPU.
 
+## Triton Fast Path
+
+On CUDA devices the LLM example uses `triton_gidx` by default. The fast path
+keeps the same analog simulation order while reducing software overhead:
+
+- direct-final mode-0 kernels fuse input-voltage quantization, conductance
+  restoration, current accumulation, ADC quantization, slice weighting, and
+  output writeback for common 2-D Linear inference shapes;
+- shape-aware auto configuration (`--triton-auto-config`, enabled by default)
+  selects conservative block and output-chunk sizes per Linear shape instead of
+  applying one global tile choice to attention, MLP, and lm_head layers;
+- mode-1 differential-pair inference reuses the same guarded scheduling path
+  but keeps `--mode1-input-tile-group 1` by default because larger input-tile
+  groups can be slower on Qwen/Llama-style MLP layers.
+
+The auto configuration is a runtime scheduling guard only. It does not change
+the configured array size, DAC/ADC precision, conductance levels, read/write
+variation, or the selected mapping mode.
+
 ## Llama-3.1-8B WikiText Example
 
 Install the optional LLM packages:
@@ -64,7 +83,8 @@ python examples/13_llama_inference.py \
   --linearmem-device engine \
   --array-size 64 \
   --input-slice 1,1,1,1,1 \
-  --weight-slice 1,1,1,1,1
+  --weight-slice 1,1,1,1,1 \
+  --triton-auto-config
 ```
 
 Run Mode 1 with differential-pair weights:
@@ -76,7 +96,8 @@ python examples/13_llama_inference.py \
   --execution speed \
   --array-size 64 \
   --g-level 16 \
-  --rdac-bits 4
+  --rdac-bits 4 \
+  --mode1-input-tile-group 1
 ```
 
 For smaller GPUs, switch to streaming:
