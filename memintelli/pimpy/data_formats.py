@@ -32,7 +32,7 @@ class SlicedData(object):
         """
         self.bw_e = bw_e
         self.is_weight = is_weight
-        self.device = torch.device('cpu') if device is None else device
+        self.device = torch.device('cpu') if device is None else torch.device(device)
         self.shape = None
         self.inference = inference
         # if inference is True, the sliced data of weight keeps the conductance of G
@@ -46,7 +46,7 @@ class SlicedData(object):
         if slice_method[0] != 1:
             raise ValueError('The first bit of the slice method should be 1')
         self.slice_method = slice_method
-        self.device = torch.device('cpu') if device is None else device
+        self.device = torch.device('cpu') if device is None else torch.device(device)
         self.shape = None
 
         self.sliced_data = None
@@ -54,9 +54,9 @@ class SlicedData(object):
         self.max_data = None
         self.e_bias = None
 
-        self.sliced_max_weights = torch.empty(len(slice_method), device=device)
-        self.sliced_weights = torch.empty(len(slice_method), device=device)
-        self._init_data(slice_method, device)
+        self.sliced_max_weights = torch.empty(len(slice_method), device=self.device)
+        self.sliced_weights = torch.empty(len(slice_method), device=self.device)
+        self._init_data(slice_method, self.device)
 
     def _init_data(self, slice_method: torch.Tensor, device):
         assert slice_method[0] == 1, 'the first slice should be 1'
@@ -245,3 +245,16 @@ class SlicedData(object):
             self.max_data = self.max_data.squeeze(0)
             if self.e_bias is not None:
                 self.e_bias = self.e_bias.squeeze(0)
+
+
+# v3 keeps the public SlicedData name for source compatibility, but routes it
+# through the multimode backend. Mode 0 is the original two's-complement bit
+# slicing path, so existing code keeps its behavior while future optimization
+# work targets one backend.
+from memintelli.pimpy.data_formats_multimode import SlicedDataMultiMode as _SlicedDataMultiMode
+
+
+class SlicedData(_SlicedDataMultiMode):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("mode", 0)
+        super().__init__(*args, **kwargs)

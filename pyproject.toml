@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memintelli"
-version = "0.0.1.3"
+version = "0.0.2.1"
 authors = [
     {name = "Odysseia", email = "1548384176@qq.com"},
 ]
@@ -32,8 +32,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/zzzzzzzzzzw/Memintelli"
-Repository = "https://github.com/zzzzzzzzzzw/Memintelli"
+Homepage = "https://github.com/zhuizhou/memintelli_flash"
+Repository = "https://github.com/zhuizhou/memintelli_flash"
 
 [project.optional-dependencies]
 cuda = [
@@ -41,9 +41,15 @@ cuda = [
     "torchvision==0.16.1+cu118", 
     "torchaudio==2.1.1+cu118",
 ]
+llm = [
+    "transformers",
+    "datasets",
+    "accelerate",
+    "sentencepiece",
+]
 
 [tool.setuptools.packages.find]
 include = ["memintelli*"]
 
 [tool.setuptools]
-zip-safe = false 
+zip-safe = false

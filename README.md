@@ -121,6 +121,13 @@ if __name__ == "__main__":
 ```
 You can find more examples in the <u>[`examples`](./examples)</u> folder of the project. 
 
+### LLM multimode inference
+
+This branch also includes a multimode LinearMem inference path for LLMs. See
+[`MULTIMODE_LLM.md`](./MULTIMODE_LLM.md) and
+[`examples/13_llama_inference.py`](./examples/13_llama_inference.py) for
+Llama-3.1-8B WikiText-2 inference with `mode=0`, `mode=1`, and `mode=2`.
+
 ## Todo list
 - [ ] Non-DNN applications based on matrix multiplication (e.g., `signal transformation`, `scientific computing`, `similarity computation`, `combinatorial optimization`)
 - [ ] `PTQ` support. 
