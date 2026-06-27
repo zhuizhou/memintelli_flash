@@ -47,7 +47,7 @@ class DPETensorMultiMode(object):
         triton_gidx_direct_final_output=True,
         triton_mode1_gidx_direct_final=True,
         triton_mode1_input_tile_group=1,
-        triton_mode1_chunked_direct_final=False,
+        triton_mode1_chunked_direct_final=True,
         triton_mode2_diff_direct_final=True,
         triton_mode2_diff_gidx_from_slices=False,
         triton_mode2_diff_activation_slices=False,
@@ -141,9 +141,9 @@ class DPETensorMultiMode(object):
                 the output. Values >1 reduce final-output atomic writes when
                 the full input dimension spans multiple Mode-1 tiles.
             triton_mode1_chunked_direct_final (bool): Try Mode-1 direct-final
-                on output chunks for very wide layers. This is experimental
-                and default-off because it can be slower than the grouped GEMM
-                fallback on LLM MLP expansion layers.
+                on output chunks for very wide layers. The shape-aware plan
+                keeps regular MLP layers whole and chunks lm_head-like layers
+                that would otherwise fall back to grouped GEMM.
             direct_output_chunk_write (bool): Write finalized 2-D output
                 chunks into the final output buffer directly instead of keeping
                 all chunks and concatenating them at the end.
@@ -559,7 +559,7 @@ class DPETensorMultiMode(object):
             block_r = 32 if rows >= 32 else 16
             block_l = 16 if tile_cols >= 16 else max(1, tile_cols)
             block_k = 64 if tile_k >= 64 else max(16, tile_k)
-            chunk_limit = min(out_tiles, chunk_limit, 256)
+            chunk_limit = min(out_tiles, chunk_limit, 192)
             if out_features <= 4096:
                 chunk_limit = min(chunk_limit, max(1, out_tiles))
             input_tile_group = 1

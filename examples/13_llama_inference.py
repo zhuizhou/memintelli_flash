@@ -258,6 +258,7 @@ def build_engine(args: argparse.Namespace, device: torch.device) -> DPETensorMul
         triton_direct_final_output=True,
         triton_mode1_gidx_direct_final=True,
         triton_mode1_input_tile_group=args.mode1_input_tile_group,
+        triton_mode1_chunked_direct_final=args.mode1_chunked_direct_final,
         triton_mode2_diff_direct_final=True,
         triton_mode2_diff_fuse_input_slices=True,
         direct_output_chunk_write=True,
@@ -393,6 +394,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--triton-output-chunk-limit", type=int, default=256)
     parser.add_argument("--triton-auto-config", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mode1-input-tile-group", type=int, default=1)
+    parser.add_argument("--mode1-chunked-direct-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--chunk-mb", type=float, default=64.0)
     parser.add_argument("--execution-reserve-gb", type=float, default=4.0)
     parser.add_argument("--pin-policy", choices=["persistent", "window"], default="persistent")

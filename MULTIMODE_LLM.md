@@ -52,7 +52,10 @@ keeps the same analog simulation order while reducing software overhead:
   applying one global tile choice to attention, MLP, and lm_head layers;
 - mode-1 differential-pair inference reuses the same guarded scheduling path
   but keeps `--mode1-input-tile-group 1` by default because larger input-tile
-  groups can be slower on Qwen/Llama-style MLP layers.
+  groups can be slower on Qwen/Llama-style MLP layers;
+- very wide mode-1 output layers, such as lm_head, use chunked direct-final
+  output by default (`--mode1-chunked-direct-final`) so they do not fall back to
+  the slower grouped-GEMM path.
 
 The auto configuration is a runtime scheduling guard only. It does not change
 the configured array size, DAC/ADC precision, conductance levels, read/write
@@ -97,7 +100,8 @@ python examples/13_llama_inference.py \
   --array-size 64 \
   --g-level 16 \
   --rdac-bits 4 \
-  --mode1-input-tile-group 1
+  --mode1-input-tile-group 1 \
+  --mode1-chunked-direct-final
 ```
 
 For smaller GPUs, switch to streaming:
