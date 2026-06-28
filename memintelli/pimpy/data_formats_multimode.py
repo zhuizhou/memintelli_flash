@@ -58,6 +58,7 @@ class SlicedDataMultiMode(object):
             raise ValueError("First element of slice_method must be 1 (sign bit).")
         self.slice_method = slice_method
         self.total_bits = int(torch.sum(slice_method).item())
+        self.is_uniform_1bit_slices = all(int(v.item()) == 1 for v in slice_method.detach().cpu())
 
         # signed-view fields (all modes)
         self.sliced_data = None
@@ -66,6 +67,9 @@ class SlicedDataMultiMode(object):
         self.e_bias = None
         self.mode1_w_max = None
         self.activation_slice_fused = False
+        self._activation_slice_buffer_key = None
+        self._activation_slice_buffer = None
+        self._activation_max_buffer = None
 
         # differential-pair branch fields (mode 2 only)
         self.sliced_data_p = None
@@ -245,7 +249,7 @@ class SlicedDataMultiMode(object):
                 ),
             )
         else:
-            self._slice_data_tc(data, skip_quantized=skip_qd)
+            self._slice_data_tc(data, skip_quantized=skip_qd, engine=engine)
 
         self.shape = data.shape
 
@@ -309,7 +313,7 @@ class SlicedDataMultiMode(object):
         self.G_is_compressed = True
 
 
-    def _slice_data_tc(self, mat: torch.Tensor, skip_quantized: bool = False):
+    def _slice_data_tc(self, mat: torch.Tensor, skip_quantized: bool = False, engine=None):
         """
         Slice data using standard two's-complement quantization for Mode 0.
         
@@ -328,7 +332,7 @@ class SlicedDataMultiMode(object):
             unsqueezed = True
 
         qg, ps, ngr, ngc, ndr, ndc = self._geom(mat)
-        if self._try_slice_data_tc_triton(mat, qg, ps, ngr, ngc, ndr, ndc, skip_quantized):
+        if self._try_slice_data_tc_triton(mat, qg, ps, ngr, ngc, ndr, ndc, skip_quantized, engine):
             return
         tiled, max_abs = self._tile(mat, ngr, ngc, ndr, ndc, qg, ps)
 
@@ -362,7 +366,7 @@ class SlicedDataMultiMode(object):
             if self.e_bias is not None:
                 self.e_bias = self.e_bias.squeeze(0)
 
-    def _try_slice_data_tc_triton(self, mat, qg, ps, ngr, ngc, ndr, ndc, skip_quantized):
+    def _try_slice_data_tc_triton(self, mat, qg, ps, ngr, ngc, ndr, ndc, skip_quantized, engine=None):
         """Try the restricted fused activation slicer for mode-0 2-D inference."""
         if not (
             skip_quantized
@@ -385,14 +389,43 @@ class SlicedDataMultiMode(object):
             return False
         try:
             from memintelli.pimpy.triton_fast_accumulate import triton_slice_mode0_2d_uniform1
+            rows, cols = int(mat.shape[1]), int(mat.shape[2])
+            tile_cols = int(ps[1])
+            tile_count = math.ceil(cols / tile_cols)
+            buffer_key = (
+                str(mat.device),
+                str(mat.dtype),
+                rows,
+                tile_count,
+                len(self.slice_method),
+                tile_cols,
+            )
+            sliced_out = None
+            max_data_out = None
+            if (
+                bool(getattr(engine, "triton_reuse_activation_slice_buffer", False))
+                and self._activation_slice_buffer_key == buffer_key
+            ):
+                sliced_out = self._activation_slice_buffer
+                max_data_out = self._activation_max_buffer
             sliced, max_data = triton_slice_mode0_2d_uniform1(
                 mat.squeeze(0),
                 input_slices=len(self.slice_method),
-                tile_cols=int(ps[1]),
+                tile_cols=tile_cols,
                 qmax=max(2 ** (self.total_bits - 1) - 1, 1),
+                sliced_out=sliced_out,
+                max_data_out=max_data_out,
             )
         except Exception:
             return False
+        if bool(getattr(engine, "triton_reuse_activation_slice_buffer", False)):
+            self._activation_slice_buffer_key = buffer_key
+            self._activation_slice_buffer = sliced
+            self._activation_max_buffer = max_data
+        else:
+            self._activation_slice_buffer_key = None
+            self._activation_slice_buffer = None
+            self._activation_max_buffer = None
         self.sliced_data = sliced
         self.max_data = max_data
         self.e_bias = None

@@ -227,6 +227,19 @@ def build_engine(args: argparse.Namespace, device: torch.device) -> DPETensorMul
     backend = args.backend
     if backend == "auto":
         backend = "triton_gidx" if device.type == "cuda" else "torch"
+    overlap_restore = (
+        args.overlap_restore_direct
+        if args.overlap_restore_direct is not None
+        else (
+            args.execution == "speed"
+            and args.mode == 0
+            and args.read_variation > 0.0
+            and args.read_variation_seed is None
+        )
+    )
+    reuse_input_voltage = args.reuse_input_voltage
+    if reuse_input_voltage is None:
+        reuse_input_voltage = args.mode != 0
 
     return DPETensorMultiMode(
         HGS=args.hgs,
@@ -253,9 +266,10 @@ def build_engine(args: argparse.Namespace, device: torch.device) -> DPETensorMul
         triton_output_chunk_limit=args.triton_output_chunk_limit,
         triton_auto_config=args.triton_auto_config,
         triton_gidx_fuse_input_slices=True,
-        triton_reuse_input_voltage=True,
+        triton_reuse_input_voltage=bool(reuse_input_voltage),
         triton_gidx_direct_final_output=True,
         triton_direct_final_output=True,
+        triton_overlap_restore_direct=bool(overlap_restore),
         triton_mode1_gidx_direct_final=True,
         triton_mode1_input_tile_group=args.mode1_input_tile_group,
         triton_mode1_chunked_direct_final=args.mode1_chunked_direct_final,
@@ -393,6 +407,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--triton-block-k", type=int, default=64)
     parser.add_argument("--triton-output-chunk-limit", type=int, default=256)
     parser.add_argument("--triton-auto-config", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--overlap-restore-direct", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--reuse-input-voltage", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--mode1-input-tile-group", type=int, default=1)
     parser.add_argument("--mode1-chunked-direct-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--chunk-mb", type=float, default=64.0)
@@ -425,7 +441,9 @@ def main(argv: Iterable[str] | None = None) -> None:
         f"model={args.model}, mode={args.mode}, execution={args.execution}, "
         f"device={device}, model_dtype={model_dtype}, engine_dtype={engine.compute_dtype}, "
         f"array={args.array_size}, slices={args.input_slice}/{args.weight_slice}, "
-        f"rdac={rdac_bits}b, radc={args.radc_bits}b, g_level={g_level}"
+        f"rdac={rdac_bits}b, radc={args.radc_bits}b, g_level={g_level}, "
+        f"overlap_restore={engine.triton_overlap_restore_direct}, "
+        f"reuse_input_voltage={engine.triton_reuse_input_voltage}"
     )
     if args.dry_run:
         return

@@ -47,6 +47,11 @@ keeps the same analog simulation order while reducing software overhead:
 - direct-final mode-0 kernels fuse input-voltage quantization, conductance
   restoration, current accumulation, ADC quantization, slice weighting, and
   output writeback for common 2-D Linear inference shapes;
+- mode-0 speed execution automatically overlaps read-noisy conductance restore
+  with direct-final consumption when random read variation is enabled. This
+  hides part of the restore latency while preserving the same G-index,
+  DAC/ADC, and slice settings. Pass `--no-overlap-restore-direct` in the Llama
+  example to disable this scheduling optimization;
 - shape-aware auto configuration (`--triton-auto-config`, enabled by default)
   selects conservative block and output-chunk sizes per Linear shape instead of
   applying one global tile choice to attention, MLP, and lm_head layers;
@@ -89,6 +94,10 @@ python examples/13_llama_inference.py \
   --weight-slice 1,1,1,1,1 \
   --triton-auto-config
 ```
+
+For reproducible read-noise streams, pass `--read-variation-seed`. The
+restore/direct-final overlap is then disabled automatically because the strict
+fixed-seed ordering is intentionally conservative.
 
 Run Mode 1 with differential-pair weights:
 

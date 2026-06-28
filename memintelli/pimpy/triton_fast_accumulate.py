@@ -35,6 +35,8 @@ def triton_slice_mode0_2d_uniform1(
     tile_cols: int,
     qmax: int,
     block_r: int = 16,
+    sliced_out: torch.Tensor | None = None,
+    max_data_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Bit-slice a 2-D mode-0 activation tensor for uniform 1-bit slices.
 
@@ -54,12 +56,28 @@ def triton_slice_mode0_2d_uniform1(
     x0 = x.contiguous()
     rows, cols = x0.shape
     tile_count = triton.cdiv(cols, tile_cols)
-    sliced = torch.empty(
-        (rows, tile_count, input_slices, 1, tile_cols),
-        device=x0.device,
-        dtype=torch.uint8,
-    )
-    max_data = torch.empty((rows, tile_count, 1, 1), device=x0.device, dtype=x0.dtype)
+    expected_sliced_shape = (rows, tile_count, input_slices, 1, tile_cols)
+    expected_max_shape = (rows, tile_count, 1, 1)
+    if sliced_out is None:
+        sliced = torch.empty(expected_sliced_shape, device=x0.device, dtype=torch.uint8)
+    else:
+        if tuple(sliced_out.shape) != expected_sliced_shape:
+            raise ValueError(
+                f"sliced_out shape mismatch: expected {expected_sliced_shape}, got {tuple(sliced_out.shape)}"
+            )
+        if sliced_out.device != x0.device or sliced_out.dtype != torch.uint8:
+            raise ValueError("sliced_out must be a uint8 tensor on the same device as x.")
+        sliced = sliced_out
+    if max_data_out is None:
+        max_data = torch.empty(expected_max_shape, device=x0.device, dtype=x0.dtype)
+    else:
+        if tuple(max_data_out.shape) != expected_max_shape:
+            raise ValueError(
+                f"max_data_out shape mismatch: expected {expected_max_shape}, got {tuple(max_data_out.shape)}"
+            )
+        if max_data_out.device != x0.device or max_data_out.dtype != x0.dtype:
+            raise ValueError("max_data_out must have the same device and dtype as x.")
+        max_data = max_data_out
     grid = (triton.cdiv(rows, block_r), tile_count)
     _slice_mode0_2d_uniform1_kernel[grid](
         x0,
@@ -500,6 +518,85 @@ if triton is not None:
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < total
         idx_f = tl.load(idx + offs, mask=mask, other=0).to(tl.float32)
+        g_abs = LGS + idx_f * Q_G
+        noise = tl.randn(NOISE_SEED, noise_offset_base + offs)
+        shifted = g_abs * tl.exp(noise * READ_SIGMA) - LGS
+        tl.store(out + offs, shifted, mask=mask)
+
+
+    @triton.jit
+    def _restore_gidx_read_noise_strided_5d_kernel(
+        idx,
+        out,
+        noise_offset_base,
+        total: tl.constexpr,
+        M: tl.constexpr,
+        P: tl.constexpr,
+        S: tl.constexpr,
+        K: tl.constexpr,
+        L: tl.constexpr,
+        idx_s0: tl.constexpr,
+        idx_s1: tl.constexpr,
+        idx_s2: tl.constexpr,
+        idx_s3: tl.constexpr,
+        idx_s4: tl.constexpr,
+        LGS: tl.constexpr,
+        Q_G: tl.constexpr,
+        READ_SIGMA: tl.constexpr,
+        NOISE_SEED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < total
+
+        logical = offs
+        l = logical % L
+        logical = logical // L
+        k = logical % K
+        logical = logical // K
+        s = logical % S
+        logical = logical // S
+        p = logical % P
+        m = logical // P
+
+        idx_offs = (
+            m.to(tl.int64) * idx_s0
+            + p.to(tl.int64) * idx_s1
+            + s.to(tl.int64) * idx_s2
+            + k.to(tl.int64) * idx_s3
+            + l.to(tl.int64) * idx_s4
+        )
+        idx_f = tl.load(idx + idx_offs, mask=mask, other=0).to(tl.float32)
+        g_abs = LGS + idx_f * Q_G
+        noise = tl.randn(NOISE_SEED, noise_offset_base + offs)
+        shifted = g_abs * tl.exp(noise * READ_SIGMA) - LGS
+        tl.store(out + offs, shifted, mask=mask)
+
+
+    @triton.jit
+    def _restore_gidx_read_noise_strided_m_slab_kernel(
+        idx,
+        out,
+        noise_offset_base,
+        total: tl.constexpr,
+        M: tl.constexpr,
+        SLAB: tl.constexpr,
+        idx_s0: tl.constexpr,
+        LGS: tl.constexpr,
+        Q_G: tl.constexpr,
+        READ_SIGMA: tl.constexpr,
+        NOISE_SEED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < total
+
+        m = offs // SLAB
+        inner = offs - m * SLAB
+        idx_offs = m.to(tl.int64) * idx_s0 + inner.to(tl.int64)
+        idx_f = tl.load(idx + idx_offs, mask=mask & (m < M), other=0).to(tl.float32)
         g_abs = LGS + idx_f * Q_G
         noise = tl.randn(NOISE_SEED, noise_offset_base + offs)
         shifted = g_abs * tl.exp(noise * READ_SIGMA) - LGS
@@ -1265,6 +1362,7 @@ if triton is not None:
         DOT_DTYPE: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         USE_READ_NOISE: tl.constexpr,
+        BINARY_INPUT_SLICES: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_L: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -1300,7 +1398,8 @@ if triton is not None:
         ).to(tl.float32)
 
         for i in tl.static_range(0, I):
-            xmax_i = tl.load(x_slice_max + i).to(tl.float32)
+            if not BINARY_INPUT_SLICES:
+                xmax_i = tl.load(x_slice_max + i).to(tl.float32)
             for s in tl.static_range(0, S):
                 cur = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
                 for k0 in tl.static_range(0, K, BLOCK_K):
@@ -1316,7 +1415,10 @@ if triton is not None:
                         mask=mask_r[:, None] & mask_k[None, :],
                         other=0.0,
                     ).to(tl.float32)
-                    v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+                    if BINARY_INPUT_SLICES:
+                        v = x_raw * VREAD
+                    else:
+                        v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
                     idx0 = tl.load(
                         gidx0
                         + m * g_s0
@@ -1345,6 +1447,154 @@ if triton is not None:
                         w0 = w0.to(tl.bfloat16)
                     cur += tl.dot(v, w0, input_precision=INPUT_PRECISION)
 
+                q = _round_even(cur / ADC_REF * RADC_SCALE) / RADC_SCALE
+                scale_is = tl.load(scale + i * scale_s0 + s * scale_s1)
+                tile += q * scale_is
+
+        tile *= x_tile_max[:, None] * mat_tile_max * FINAL_SCALE
+        out_cols = OUT_COL_OFFSET + pid_p * L + offs_l
+        tl.atomic_add(
+            out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+            tile,
+            mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+            sem="relaxed",
+        )
+
+
+    @triton.jit
+    def _gidx_accumulate_2d_mode0_input_slices_direct_final_reuse_w_kernel(
+        x_sliced,
+        gidx0,
+        x_slice_max,
+        scale,
+        x_max,
+        mat_max,
+        out,
+        x_s0: tl.constexpr,
+        x_s1: tl.constexpr,
+        x_s2: tl.constexpr,
+        x_s3: tl.constexpr,
+        x_s4: tl.constexpr,
+        g_s0: tl.constexpr,
+        g_s1: tl.constexpr,
+        g_s2: tl.constexpr,
+        g_s3: tl.constexpr,
+        g_s4: tl.constexpr,
+        scale_s0: tl.constexpr,
+        scale_s1: tl.constexpr,
+        xm_s0: tl.constexpr,
+        xm_s1: tl.constexpr,
+        mm_s0: tl.constexpr,
+        mm_s1: tl.constexpr,
+        out_s0: tl.constexpr,
+        out_s1: tl.constexpr,
+        OUT_COL_OFFSET,
+        OUT_COLS,
+        N: tl.constexpr,
+        M: tl.constexpr,
+        I: tl.constexpr,
+        P: tl.constexpr,
+        J: tl.constexpr,
+        K: tl.constexpr,
+        L: tl.constexpr,
+        S: tl.constexpr,
+        LGS: tl.constexpr,
+        Q_G: tl.constexpr,
+        READ_SIGMA: tl.constexpr,
+        NOISE_SEED: tl.constexpr,
+        NOISE_OFFSET_BASE,
+        ADC_REF: tl.constexpr,
+        RDAC_SCALE: tl.constexpr,
+        RADC_SCALE: tl.constexpr,
+        VREAD: tl.constexpr,
+        FINAL_SCALE: tl.constexpr,
+        DOT_DTYPE: tl.constexpr,
+        INPUT_PRECISION: tl.constexpr,
+        USE_READ_NOISE: tl.constexpr,
+        BINARY_INPUT_SLICES: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_L: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_R_BLOCKS: tl.constexpr,
+        NUM_L_BLOCKS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pid_r = pid % NUM_R_BLOCKS
+        pid_mpl = pid // NUM_R_BLOCKS
+        m = pid_mpl % M
+        pid_pl = pid_mpl // M
+        pid_p = pid_pl // NUM_L_BLOCKS
+        pid_l = pid_pl - pid_p * NUM_L_BLOCKS
+
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_n = offs_r // J
+        offs_j = offs_r - offs_n * J
+        mask_r = offs_r < (N * J)
+        mask_l = offs_l < L
+        mask_k = offs_k < K
+
+        tile = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+        x_tile_max = tl.load(
+            x_max + offs_n * xm_s0 + m * xm_s1,
+            mask=mask_r,
+            other=0.0,
+        ).to(tl.float32)
+        mat_tile_max = tl.load(
+            mat_max + m * mm_s0 + pid_p * mm_s1,
+            mask=pid_p < P,
+            other=0.0,
+        ).to(tl.float32)
+
+        for s in tl.static_range(0, S):
+            idx0 = tl.load(
+                gidx0
+                + m * g_s0
+                + pid_p * g_s1
+                + s * g_s2
+                + offs_k[:, None] * g_s3
+                + offs_l[None, :] * g_s4,
+                mask=mask_k[:, None] & mask_l[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            if USE_READ_NOISE:
+                g_abs = LGS + idx0 * Q_G
+                noise_offset = (
+                    (((m * P + pid_p) * S + s) * K + offs_k[:, None]) * L
+                    + offs_l[None, :]
+                )
+                noise = tl.randn(NOISE_SEED, NOISE_OFFSET_BASE + noise_offset)
+                w0 = g_abs * tl.exp(noise * READ_SIGMA) - LGS
+            else:
+                w0 = idx0 * Q_G
+            if DOT_DTYPE == 1:
+                w0 = w0.to(tl.float16)
+            elif DOT_DTYPE == 2:
+                w0 = w0.to(tl.bfloat16)
+
+            for i in tl.static_range(0, I):
+                if not BINARY_INPUT_SLICES:
+                    xmax_i = tl.load(x_slice_max + i).to(tl.float32)
+                x_raw = tl.load(
+                    x_sliced
+                    + offs_n[:, None] * x_s0
+                    + m * x_s1
+                    + i * x_s2
+                    + offs_j[:, None] * x_s3
+                    + offs_k[None, :] * x_s4,
+                    mask=mask_r[:, None] & mask_k[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if BINARY_INPUT_SLICES:
+                    v = x_raw * VREAD
+                else:
+                    v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+                if DOT_DTYPE == 1:
+                    v = v.to(tl.float16)
+                elif DOT_DTYPE == 2:
+                    v = v.to(tl.bfloat16)
+                cur = tl.dot(v, w0, input_precision=INPUT_PRECISION)
                 q = _round_even(cur / ADC_REF * RADC_SCALE) / RADC_SCALE
                 scale_is = tl.load(scale + i * scale_s0 + s * scale_s1)
                 tile += q * scale_is
@@ -1641,6 +1891,7 @@ if triton is not None:
         FINAL_SCALE: tl.constexpr,
         DOT_DTYPE: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
+        BINARY_INPUT_SLICES: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_L: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -1676,7 +1927,8 @@ if triton is not None:
         ).to(tl.float32)
 
         for i in tl.static_range(0, I):
-            xmax_i = tl.load(x_slice_max + i).to(tl.float32)
+            if not BINARY_INPUT_SLICES:
+                xmax_i = tl.load(x_slice_max + i).to(tl.float32)
             for s in tl.static_range(0, S):
                 cur = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
                 for k0 in tl.static_range(0, K, BLOCK_K):
@@ -1692,7 +1944,10 @@ if triton is not None:
                         mask=mask_r[:, None] & mask_k[None, :],
                         other=0.0,
                     ).to(tl.float32)
-                    v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+                    if BINARY_INPUT_SLICES:
+                        v = x_raw * VREAD
+                    else:
+                        v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
                     w0 = tl.load(
                         g0
                         + m * g_s0
@@ -1723,6 +1978,560 @@ if triton is not None:
             mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
             sem="relaxed",
         )
+
+
+    @triton.jit
+    def _fast_accumulate_2d_input_slices_direct_final_precomputed_v_kernel(
+        v_sliced,
+        g0,
+        scale,
+        x_max,
+        mat_max,
+        out,
+        v_s0: tl.constexpr,
+        v_s1: tl.constexpr,
+        v_s2: tl.constexpr,
+        v_s3: tl.constexpr,
+        v_s4: tl.constexpr,
+        g_s0: tl.constexpr,
+        g_s1: tl.constexpr,
+        g_s2: tl.constexpr,
+        g_s3: tl.constexpr,
+        g_s4: tl.constexpr,
+        scale_s0: tl.constexpr,
+        scale_s1: tl.constexpr,
+        xm_s0: tl.constexpr,
+        xm_s1: tl.constexpr,
+        mm_s0: tl.constexpr,
+        mm_s1: tl.constexpr,
+        out_s0: tl.constexpr,
+        out_s1: tl.constexpr,
+        OUT_COL_OFFSET,
+        OUT_COLS,
+        N: tl.constexpr,
+        M: tl.constexpr,
+        I: tl.constexpr,
+        P: tl.constexpr,
+        J: tl.constexpr,
+        K: tl.constexpr,
+        L: tl.constexpr,
+        S: tl.constexpr,
+        ADC_REF: tl.constexpr,
+        RADC_SCALE: tl.constexpr,
+        FINAL_SCALE: tl.constexpr,
+        DOT_DTYPE: tl.constexpr,
+        INPUT_PRECISION: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_L: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_R_BLOCKS: tl.constexpr,
+        NUM_L_BLOCKS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pid_r = pid % NUM_R_BLOCKS
+        pid_mpl = pid // NUM_R_BLOCKS
+        m = pid_mpl % M
+        pid_pl = pid_mpl // M
+        pid_p = pid_pl // NUM_L_BLOCKS
+        pid_l = pid_pl - pid_p * NUM_L_BLOCKS
+
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_n = offs_r // J
+        offs_j = offs_r - offs_n * J
+        mask_r = offs_r < (N * J)
+        mask_l = offs_l < L
+
+        tile = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+        x_tile_max = tl.load(
+            x_max + offs_n * xm_s0 + m * xm_s1,
+            mask=mask_r,
+            other=0.0,
+        ).to(tl.float32)
+        mat_tile_max = tl.load(
+            mat_max + m * mm_s0 + pid_p * mm_s1,
+            mask=pid_p < P,
+            other=0.0,
+        ).to(tl.float32)
+
+        for i in tl.static_range(0, I):
+            for s in tl.static_range(0, S):
+                cur = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+                for k0 in tl.static_range(0, K, BLOCK_K):
+                    k = k0 + offs_k
+                    mask_k = k < K
+                    v = tl.load(
+                        v_sliced
+                        + offs_n[:, None] * v_s0
+                        + m * v_s1
+                        + i * v_s2
+                        + offs_j[:, None] * v_s3
+                        + k[None, :] * v_s4,
+                        mask=mask_r[:, None] & mask_k[None, :],
+                        other=0.0,
+                    )
+                    w0 = tl.load(
+                        g0
+                        + m * g_s0
+                        + pid_p * g_s1
+                        + s * g_s2
+                        + k[:, None] * g_s3
+                        + offs_l[None, :] * g_s4,
+                        mask=mask_k[:, None] & mask_l[None, :],
+                        other=0.0,
+                    )
+                    if DOT_DTYPE == 1:
+                        v = v.to(tl.float16)
+                        w0 = w0.to(tl.float16)
+                    elif DOT_DTYPE == 2:
+                        v = v.to(tl.bfloat16)
+                        w0 = w0.to(tl.bfloat16)
+                    cur += tl.dot(v, w0, input_precision=INPUT_PRECISION)
+
+                q = _round_even(cur / ADC_REF * RADC_SCALE) / RADC_SCALE
+                scale_is = tl.load(scale + i * scale_s0 + s * scale_s1)
+                tile += q * scale_is
+
+        tile *= x_tile_max[:, None] * mat_tile_max * FINAL_SCALE
+        out_cols = OUT_COL_OFFSET + pid_p * L + offs_l
+        tl.atomic_add(
+            out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+            tile,
+            mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+            sem="relaxed",
+        )
+
+
+    @triton.jit
+    def _fast_accumulate_2d_input_slices_direct_final_reuse_v_kernel(
+        x_sliced,
+        g0,
+        x_slice_max,
+        scale,
+        x_max,
+        mat_max,
+        out,
+        x_s0: tl.constexpr,
+        x_s1: tl.constexpr,
+        x_s2: tl.constexpr,
+        x_s3: tl.constexpr,
+        x_s4: tl.constexpr,
+        g_s0: tl.constexpr,
+        g_s1: tl.constexpr,
+        g_s2: tl.constexpr,
+        g_s3: tl.constexpr,
+        g_s4: tl.constexpr,
+        scale_s0: tl.constexpr,
+        scale_s1: tl.constexpr,
+        xm_s0: tl.constexpr,
+        xm_s1: tl.constexpr,
+        mm_s0: tl.constexpr,
+        mm_s1: tl.constexpr,
+        out_s0: tl.constexpr,
+        out_s1: tl.constexpr,
+        OUT_COL_OFFSET,
+        OUT_COLS,
+        N: tl.constexpr,
+        M: tl.constexpr,
+        I: tl.constexpr,
+        P: tl.constexpr,
+        J: tl.constexpr,
+        K: tl.constexpr,
+        L: tl.constexpr,
+        S: tl.constexpr,
+        ADC_REF: tl.constexpr,
+        RDAC_SCALE: tl.constexpr,
+        RADC_SCALE: tl.constexpr,
+        VREAD: tl.constexpr,
+        FINAL_SCALE: tl.constexpr,
+        DOT_DTYPE: tl.constexpr,
+        INPUT_PRECISION: tl.constexpr,
+        BINARY_INPUT_SLICES: tl.constexpr,
+        USE_ATOMIC: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_L: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_R_BLOCKS: tl.constexpr,
+        NUM_L_BLOCKS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pid_r = pid % NUM_R_BLOCKS
+        pid_mpl = pid // NUM_R_BLOCKS
+        m = pid_mpl % M
+        pid_pl = pid_mpl // M
+        pid_p = pid_pl // NUM_L_BLOCKS
+        pid_l = pid_pl - pid_p * NUM_L_BLOCKS
+
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_n = offs_r // J
+        offs_j = offs_r - offs_n * J
+        mask_r = offs_r < (N * J)
+        mask_l = offs_l < L
+
+        tile = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+        x_tile_max = tl.load(
+            x_max + offs_n * xm_s0 + m * xm_s1,
+            mask=mask_r,
+            other=0.0,
+        ).to(tl.float32)
+        mat_tile_max = tl.load(
+            mat_max + m * mm_s0 + pid_p * mm_s1,
+            mask=pid_p < P,
+            other=0.0,
+        ).to(tl.float32)
+
+        for i in tl.static_range(0, I):
+            if not BINARY_INPUT_SLICES:
+                xmax_i = tl.load(x_slice_max + i).to(tl.float32)
+            for k0 in tl.static_range(0, K, BLOCK_K):
+                k = k0 + offs_k
+                mask_k = k < K
+                x_raw = tl.load(
+                    x_sliced
+                    + offs_n[:, None] * x_s0
+                    + m * x_s1
+                    + i * x_s2
+                    + offs_j[:, None] * x_s3
+                    + k[None, :] * x_s4,
+                    mask=mask_r[:, None] & mask_k[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if BINARY_INPUT_SLICES:
+                    v = x_raw * VREAD
+                else:
+                    v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+                if DOT_DTYPE == 1:
+                    v = v.to(tl.float16)
+                elif DOT_DTYPE == 2:
+                    v = v.to(tl.bfloat16)
+                for s in tl.static_range(0, S):
+                    w0 = tl.load(
+                        g0
+                        + m * g_s0
+                        + pid_p * g_s1
+                        + s * g_s2
+                        + k[:, None] * g_s3
+                        + offs_l[None, :] * g_s4,
+                        mask=mask_k[:, None] & mask_l[None, :],
+                        other=0.0,
+                    )
+                    if DOT_DTYPE == 1:
+                        w0 = w0.to(tl.float16)
+                    elif DOT_DTYPE == 2:
+                        w0 = w0.to(tl.bfloat16)
+                    cur = tl.dot(v, w0, input_precision=INPUT_PRECISION)
+                    q = _round_even(cur / ADC_REF * RADC_SCALE) / RADC_SCALE
+                    scale_is = tl.load(scale + i * scale_s0 + s * scale_s1)
+                    tile += q * scale_is
+
+        tile *= x_tile_max[:, None] * mat_tile_max * FINAL_SCALE
+        out_cols = OUT_COL_OFFSET + pid_p * L + offs_l
+        if USE_ATOMIC:
+            tl.atomic_add(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                tile,
+                mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+                sem="relaxed",
+            )
+        else:
+            tl.store(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                tile,
+                mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+            )
+
+
+    @triton.jit
+    def _fast_accumulate_2d_input_slices_direct_final_reuse_w_kernel(
+        x_sliced,
+        g0,
+        x_slice_max,
+        scale,
+        x_max,
+        mat_max,
+        out,
+        x_s0: tl.constexpr,
+        x_s1: tl.constexpr,
+        x_s2: tl.constexpr,
+        x_s3: tl.constexpr,
+        x_s4: tl.constexpr,
+        g_s0: tl.constexpr,
+        g_s1: tl.constexpr,
+        g_s2: tl.constexpr,
+        g_s3: tl.constexpr,
+        g_s4: tl.constexpr,
+        scale_s0: tl.constexpr,
+        scale_s1: tl.constexpr,
+        xm_s0: tl.constexpr,
+        xm_s1: tl.constexpr,
+        mm_s0: tl.constexpr,
+        mm_s1: tl.constexpr,
+        out_s0: tl.constexpr,
+        out_s1: tl.constexpr,
+        OUT_COL_OFFSET,
+        OUT_COLS,
+        N: tl.constexpr,
+        M: tl.constexpr,
+        I: tl.constexpr,
+        P: tl.constexpr,
+        J: tl.constexpr,
+        K: tl.constexpr,
+        L: tl.constexpr,
+        S: tl.constexpr,
+        ADC_REF: tl.constexpr,
+        RDAC_SCALE: tl.constexpr,
+        RADC_SCALE: tl.constexpr,
+        VREAD: tl.constexpr,
+        FINAL_SCALE: tl.constexpr,
+        DOT_DTYPE: tl.constexpr,
+        INPUT_PRECISION: tl.constexpr,
+        BINARY_INPUT_SLICES: tl.constexpr,
+        USE_ATOMIC: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_L: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_R_BLOCKS: tl.constexpr,
+        NUM_L_BLOCKS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pid_r = pid % NUM_R_BLOCKS
+        pid_mpl = pid // NUM_R_BLOCKS
+        m = pid_mpl % M
+        pid_pl = pid_mpl // M
+        pid_p = pid_pl // NUM_L_BLOCKS
+        pid_l = pid_pl - pid_p * NUM_L_BLOCKS
+
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_n = offs_r // J
+        offs_j = offs_r - offs_n * J
+        mask_r = offs_r < (N * J)
+        mask_l = offs_l < L
+        mask_k = offs_k < K
+
+        tile = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+        x_tile_max = tl.load(
+            x_max + offs_n * xm_s0 + m * xm_s1,
+            mask=mask_r,
+            other=0.0,
+        ).to(tl.float32)
+        mat_tile_max = tl.load(
+            mat_max + m * mm_s0 + pid_p * mm_s1,
+            mask=pid_p < P,
+            other=0.0,
+        ).to(tl.float32)
+
+        for s in tl.static_range(0, S):
+            w0 = tl.load(
+                g0
+                + m * g_s0
+                + pid_p * g_s1
+                + s * g_s2
+                + offs_k[:, None] * g_s3
+                + offs_l[None, :] * g_s4,
+                mask=mask_k[:, None] & mask_l[None, :],
+                other=0.0,
+            )
+            if DOT_DTYPE == 1:
+                w0 = w0.to(tl.float16)
+            elif DOT_DTYPE == 2:
+                w0 = w0.to(tl.bfloat16)
+
+            for i in tl.static_range(0, I):
+                if not BINARY_INPUT_SLICES:
+                    xmax_i = tl.load(x_slice_max + i).to(tl.float32)
+                x_raw = tl.load(
+                    x_sliced
+                    + offs_n[:, None] * x_s0
+                    + m * x_s1
+                    + i * x_s2
+                    + offs_j[:, None] * x_s3
+                    + offs_k[None, :] * x_s4,
+                    mask=mask_r[:, None] & mask_k[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if BINARY_INPUT_SLICES:
+                    v = x_raw * VREAD
+                else:
+                    v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+                if DOT_DTYPE == 1:
+                    v = v.to(tl.float16)
+                elif DOT_DTYPE == 2:
+                    v = v.to(tl.bfloat16)
+                cur = tl.dot(v, w0, input_precision=INPUT_PRECISION)
+                q = _round_even(cur / ADC_REF * RADC_SCALE) / RADC_SCALE
+                scale_is = tl.load(scale + i * scale_s0 + s * scale_s1)
+                tile += q * scale_is
+
+        tile *= x_tile_max[:, None] * mat_tile_max * FINAL_SCALE
+        out_cols = OUT_COL_OFFSET + pid_p * L + offs_l
+        if USE_ATOMIC:
+            tl.atomic_add(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                tile,
+                mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+                sem="relaxed",
+            )
+        else:
+            tl.store(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                tile,
+                mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+            )
+
+
+    @triton.jit
+    def _fast_accumulate_2d_input_slices_direct_final_grouped_m_kernel(
+        x_sliced,
+        g0,
+        x_slice_max,
+        scale,
+        x_max,
+        mat_max,
+        out,
+        x_s0: tl.constexpr,
+        x_s1: tl.constexpr,
+        x_s2: tl.constexpr,
+        x_s3: tl.constexpr,
+        x_s4: tl.constexpr,
+        g_s0: tl.constexpr,
+        g_s1: tl.constexpr,
+        g_s2: tl.constexpr,
+        g_s3: tl.constexpr,
+        g_s4: tl.constexpr,
+        scale_s0: tl.constexpr,
+        scale_s1: tl.constexpr,
+        xm_s0: tl.constexpr,
+        xm_s1: tl.constexpr,
+        mm_s0: tl.constexpr,
+        mm_s1: tl.constexpr,
+        out_s0: tl.constexpr,
+        out_s1: tl.constexpr,
+        OUT_COL_OFFSET,
+        OUT_COLS,
+        N: tl.constexpr,
+        M: tl.constexpr,
+        I: tl.constexpr,
+        P: tl.constexpr,
+        J: tl.constexpr,
+        K: tl.constexpr,
+        L: tl.constexpr,
+        S: tl.constexpr,
+        ADC_REF: tl.constexpr,
+        RDAC_SCALE: tl.constexpr,
+        RADC_SCALE: tl.constexpr,
+        VREAD: tl.constexpr,
+        FINAL_SCALE: tl.constexpr,
+        DOT_DTYPE: tl.constexpr,
+        INPUT_PRECISION: tl.constexpr,
+        BINARY_INPUT_SLICES: tl.constexpr,
+        USE_ATOMIC: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_L: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_R_BLOCKS: tl.constexpr,
+        NUM_L_BLOCKS: tl.constexpr,
+        NUM_M_GROUPS: tl.constexpr,
+        GROUP_M_TILES: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pid_r = pid % NUM_R_BLOCKS
+        pid_rest = pid // NUM_R_BLOCKS
+        pid_mg = pid_rest % NUM_M_GROUPS
+        pid_pl = pid_rest // NUM_M_GROUPS
+        pid_p = pid_pl // NUM_L_BLOCKS
+        pid_l = pid_pl - pid_p * NUM_L_BLOCKS
+
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_n = offs_r // J
+        offs_j = offs_r - offs_n * J
+        mask_r = offs_r < (N * J)
+        mask_l = offs_l < L
+
+        group_total = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+        base_m = pid_mg * GROUP_M_TILES
+
+        for gm_i in tl.static_range(0, GROUP_M_TILES):
+            m = base_m + gm_i
+            valid_m = m < M
+            tile = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+            x_tile_max = tl.load(
+                x_max + offs_n * xm_s0 + m * xm_s1,
+                mask=mask_r & valid_m,
+                other=0.0,
+            ).to(tl.float32)
+            mat_tile_max = tl.load(
+                mat_max + m * mm_s0 + pid_p * mm_s1,
+                mask=valid_m & (pid_p < P),
+                other=0.0,
+            ).to(tl.float32)
+
+            for i in tl.static_range(0, I):
+                if not BINARY_INPUT_SLICES:
+                    xmax_i = tl.load(x_slice_max + i).to(tl.float32)
+                for s in tl.static_range(0, S):
+                    cur = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+                    for k0 in tl.static_range(0, K, BLOCK_K):
+                        k = k0 + offs_k
+                        mask_k = k < K
+                        x_raw = tl.load(
+                            x_sliced
+                            + offs_n[:, None] * x_s0
+                            + m * x_s1
+                            + i * x_s2
+                            + offs_j[:, None] * x_s3
+                            + k[None, :] * x_s4,
+                            mask=valid_m & mask_r[:, None] & mask_k[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                        if BINARY_INPUT_SLICES:
+                            v = x_raw * VREAD
+                        else:
+                            v = _round_even(x_raw / xmax_i * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+                        w0 = tl.load(
+                            g0
+                            + m * g_s0
+                            + pid_p * g_s1
+                            + s * g_s2
+                            + k[:, None] * g_s3
+                            + offs_l[None, :] * g_s4,
+                            mask=valid_m & mask_k[:, None] & mask_l[None, :],
+                            other=0.0,
+                        )
+                        if DOT_DTYPE == 1:
+                            v = v.to(tl.float16)
+                            w0 = w0.to(tl.float16)
+                        elif DOT_DTYPE == 2:
+                            v = v.to(tl.bfloat16)
+                            w0 = w0.to(tl.bfloat16)
+                        cur += tl.dot(v, w0, input_precision=INPUT_PRECISION)
+
+                    q = _round_even(cur / ADC_REF * RADC_SCALE) / RADC_SCALE
+                    scale_is = tl.load(scale + i * scale_s0 + s * scale_s1)
+                    tile += q * scale_is
+
+            group_total += tile * (x_tile_max[:, None] * mat_tile_max * FINAL_SCALE)
+
+        out_cols = OUT_COL_OFFSET + pid_p * L + offs_l
+        if USE_ATOMIC:
+            tl.atomic_add(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                group_total,
+                mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+                sem="relaxed",
+            )
+        else:
+            tl.store(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                group_total,
+                mask=mask_r[:, None] & mask_l[None, :] & (out_cols[None, :] < OUT_COLS),
+            )
 
 
     @triton.jit
@@ -3352,12 +4161,64 @@ def triton_restore_gidx_read_noise(
     noise_seed: int = 12345,
     noise_offset_base: int = 0,
     block: int = 256,
+    num_warps: int = 4,
+    strided: bool = False,
+    m_slab: bool = True,
 ) -> torch.Tensor:
     """Restore shifted conductance from level indices and apply uniform read variation."""
     if triton is None:
         raise RuntimeError(f"Triton fast accumulate is unavailable: {TRITON_IMPORT_ERROR}")
     if not idx.is_cuda:
         raise ValueError("Triton G-index restore requires a CUDA tensor.")
+
+    if strided and (not idx.is_contiguous()) and idx.dim() == 5:
+        out = torch.empty(idx.shape, device=idx.device, dtype=dtype)
+        total = idx.numel()
+        grid = (triton.cdiv(total, block),)
+        m, p, s, k, l = (int(v) for v in idx.shape)
+        idx_s0, idx_s1, idx_s2, idx_s3, idx_s4 = (int(v) for v in idx.stride())
+        slab = p * s * k * l
+        if m_slab and idx_s4 == 1 and idx_s3 == l and idx_s2 == k * l and idx_s1 == s * k * l:
+            _restore_gidx_read_noise_strided_m_slab_kernel[grid](
+                idx,
+                out,
+                int(noise_offset_base),
+                total,
+                m,
+                slab,
+                idx_s0,
+                float(lgs),
+                float(q_g),
+                float(read_sigma),
+                int(noise_seed),
+                int(block),
+                num_warps=int(num_warps),
+            )
+            return out
+        _restore_gidx_read_noise_strided_5d_kernel[grid](
+            idx,
+            out,
+            int(noise_offset_base),
+            total,
+            m,
+            p,
+            s,
+            k,
+            l,
+            idx_s0,
+            idx_s1,
+            idx_s2,
+            idx_s3,
+            idx_s4,
+            float(lgs),
+            float(q_g),
+            float(read_sigma),
+            int(noise_seed),
+            int(block),
+            num_warps=int(num_warps),
+        )
+        return out
+
     idx_c = idx.contiguous()
     out = torch.empty(idx_c.shape, device=idx_c.device, dtype=dtype)
     total = idx_c.numel()
@@ -3372,7 +4233,7 @@ def triton_restore_gidx_read_noise(
         float(read_sigma),
         int(noise_seed),
         int(block),
-        num_warps=4,
+        num_warps=int(num_warps),
     )
     return out
 
@@ -4102,6 +4963,8 @@ def triton_diff_input_accumulate_2d_from_slices_direct_final(
     block_r: int = 32,
     block_l: int = 16,
     block_k: int = 64,
+    reuse_weight_tile: bool = False,
+    binary_input_slices: bool = False,
     out: torch.Tensor | None = None,
     out_col_offset: int = 0,
     out_cols: int | None = None,
@@ -4250,6 +5113,8 @@ def triton_diff_input_accumulate_2d_from_slices_gdiff_direct_final(
     block_r: int = 32,
     block_l: int = 16,
     block_k: int = 64,
+    reuse_weight_tile: bool = False,
+    binary_input_slices: bool = False,
     out: torch.Tensor | None = None,
     out_col_offset: int = 0,
     out_cols: int | None = None,
@@ -4394,6 +5259,8 @@ def triton_diff_input_accumulate_2d_from_slices_gidx_direct_final(
     block_r: int = 32,
     block_l: int = 16,
     block_k: int = 64,
+    reuse_weight_tile: bool = False,
+    binary_input_slices: bool = False,
     out: torch.Tensor | None = None,
     out_col_offset: int = 0,
     out_cols: int | None = None,
@@ -4922,6 +5789,8 @@ def triton_gidx_accumulate_2d_input_slices_direct_final(
     block_r: int = 32,
     block_l: int = 16,
     block_k: int = 64,
+    reuse_weight_tile: bool = False,
+    binary_input_slices: bool = False,
     out: torch.Tensor | None = None,
     out_col_offset: int = 0,
     out_cols: int | None = None,
@@ -4990,6 +5859,66 @@ def triton_gidx_accumulate_2d_input_slices_direct_final(
     num_l_blocks = triton.cdiv(l, block_l)
     grid = (num_r_blocks * m * p * num_l_blocks,)
     dot_dtype = 2 if x0.dtype is torch.bfloat16 else 1 if x0.dtype is torch.float16 else 0
+    if bool(reuse_weight_tile) and int(block_k) >= int(k):
+        _gidx_accumulate_2d_mode0_input_slices_direct_final_reuse_w_kernel[grid](
+            x0,
+            g0,
+            xmax_slice,
+            scale,
+            xm,
+            mm,
+            out,
+            x0.stride(0),
+            x0.stride(1),
+            x0.stride(2),
+            x0.stride(3),
+            x0.stride(4),
+            g0.stride(0),
+            g0.stride(1),
+            g0.stride(2),
+            g0.stride(3),
+            g0.stride(4),
+            scale.stride(0),
+            scale.stride(1),
+            xm.stride(0),
+            xm.stride(1),
+            mm.stride(0),
+            mm.stride(1),
+            out.stride(0),
+            out.stride(1),
+            int(out_col_offset),
+            int(out_cols),
+            n,
+            m,
+            i_count,
+            p,
+            j,
+            k,
+            l,
+            s,
+            float(lgs),
+            float(q_g),
+            float(read_sigma),
+            int(noise_seed),
+            int(noise_offset_base),
+            float(adc_ref),
+            float(rdac - 1),
+            float(radc - 1),
+            float(vread),
+            float(1.0 / (float(x_qmax) * float(mat_qmax))),
+            dot_dtype,
+            input_precision,
+            bool(read_sigma and read_sigma > 0.0),
+            bool(binary_input_slices),
+            int(block_r),
+            int(block_l),
+            int(block_k),
+            num_r_blocks,
+            num_l_blocks,
+            num_warps=4,
+        )
+        return out
+
     _gidx_accumulate_2d_mode0_input_slices_direct_final_kernel[grid](
         x0,
         g0,
@@ -5039,6 +5968,7 @@ def triton_gidx_accumulate_2d_input_slices_direct_final(
         dot_dtype,
         input_precision,
         bool(read_sigma and read_sigma > 0.0),
+        bool(binary_input_slices),
         int(block_r),
         int(block_l),
         int(block_k),
@@ -5272,6 +6202,11 @@ def triton_fast_accumulate_2d_input_slices_direct_final(
     block_r: int = 32,
     block_l: int = 16,
     block_k: int = 64,
+    input_tile_group: int = 1,
+    reuse_input_voltage: bool = False,
+    reuse_weight_tile: bool = False,
+    binary_input_slices: bool = False,
+    num_warps: int = 4,
     out: torch.Tensor | None = None,
     out_col_offset: int = 0,
     out_cols: int | None = None,
@@ -5339,8 +6274,181 @@ def triton_fast_accumulate_2d_input_slices_direct_final(
             )
     num_r_blocks = triton.cdiv(n * j, block_r)
     num_l_blocks = triton.cdiv(l, block_l)
-    grid = (num_r_blocks * m * p * num_l_blocks,)
     dot_dtype = 2 if g0.dtype is torch.bfloat16 or x0.dtype is torch.bfloat16 else 1 if g0.dtype is torch.float16 or x0.dtype is torch.float16 else 0
+    input_tile_group = max(1, min(int(input_tile_group), int(m)))
+    if input_tile_group > 1:
+        num_m_groups = triton.cdiv(m, input_tile_group)
+        use_atomic = num_m_groups > 1
+        grid = (num_r_blocks * num_m_groups * p * num_l_blocks,)
+        _fast_accumulate_2d_input_slices_direct_final_grouped_m_kernel[grid](
+            x0,
+            g0,
+            xmax_slice,
+            scale,
+            xm,
+            mm,
+            out,
+            x0.stride(0),
+            x0.stride(1),
+            x0.stride(2),
+            x0.stride(3),
+            x0.stride(4),
+            g0.stride(0),
+            g0.stride(1),
+            g0.stride(2),
+            g0.stride(3),
+            g0.stride(4),
+            scale.stride(0),
+            scale.stride(1),
+            xm.stride(0),
+            xm.stride(1),
+            mm.stride(0),
+            mm.stride(1),
+            out.stride(0),
+            out.stride(1),
+            int(out_col_offset),
+            int(out_cols),
+            n,
+            m,
+            i_count,
+            p,
+            j,
+            k,
+            l,
+            s,
+            float(adc_ref),
+            float(rdac - 1),
+            float(radc - 1),
+            float(vread),
+            float(1.0 / (float(x_qmax) * float(mat_qmax))),
+            dot_dtype,
+            input_precision,
+            bool(binary_input_slices),
+            bool(use_atomic),
+            int(block_r),
+            int(block_l),
+            int(block_k),
+            num_r_blocks,
+            num_l_blocks,
+            num_m_groups,
+            input_tile_group,
+            num_warps=int(num_warps),
+        )
+        return out
+
+    grid = (num_r_blocks * m * p * num_l_blocks,)
+    if bool(reuse_weight_tile) and int(block_k) >= int(k):
+        use_atomic = int(m) > 1
+        _fast_accumulate_2d_input_slices_direct_final_reuse_w_kernel[grid](
+            x0,
+            g0,
+            xmax_slice,
+            scale,
+            xm,
+            mm,
+            out,
+            x0.stride(0),
+            x0.stride(1),
+            x0.stride(2),
+            x0.stride(3),
+            x0.stride(4),
+            g0.stride(0),
+            g0.stride(1),
+            g0.stride(2),
+            g0.stride(3),
+            g0.stride(4),
+            scale.stride(0),
+            scale.stride(1),
+            xm.stride(0),
+            xm.stride(1),
+            mm.stride(0),
+            mm.stride(1),
+            out.stride(0),
+            out.stride(1),
+            int(out_col_offset),
+            int(out_cols),
+            n,
+            m,
+            i_count,
+            p,
+            j,
+            k,
+            l,
+            s,
+            float(adc_ref),
+            float(rdac - 1),
+            float(radc - 1),
+            float(vread),
+            float(1.0 / (float(x_qmax) * float(mat_qmax))),
+            dot_dtype,
+            input_precision,
+            bool(binary_input_slices),
+            bool(use_atomic),
+            int(block_r),
+            int(block_l),
+            int(block_k),
+            num_r_blocks,
+            num_l_blocks,
+            num_warps=int(num_warps),
+        )
+        return out
+
+    if bool(reuse_input_voltage) and int(block_k) >= int(k):
+        use_atomic = int(m) > 1
+        _fast_accumulate_2d_input_slices_direct_final_reuse_v_kernel[grid](
+            x0,
+            g0,
+            xmax_slice,
+            scale,
+            xm,
+            mm,
+            out,
+            x0.stride(0),
+            x0.stride(1),
+            x0.stride(2),
+            x0.stride(3),
+            x0.stride(4),
+            g0.stride(0),
+            g0.stride(1),
+            g0.stride(2),
+            g0.stride(3),
+            g0.stride(4),
+            scale.stride(0),
+            scale.stride(1),
+            xm.stride(0),
+            xm.stride(1),
+            mm.stride(0),
+            mm.stride(1),
+            out.stride(0),
+            out.stride(1),
+            int(out_col_offset),
+            int(out_cols),
+            n,
+            m,
+            i_count,
+            p,
+            j,
+            k,
+            l,
+            s,
+            float(adc_ref),
+            float(rdac - 1),
+            float(radc - 1),
+            float(vread),
+            float(1.0 / (float(x_qmax) * float(mat_qmax))),
+            dot_dtype,
+            input_precision,
+            bool(binary_input_slices),
+            bool(use_atomic),
+            int(block_r),
+            int(block_l),
+            int(block_k),
+            num_r_blocks,
+            num_l_blocks,
+            num_warps=int(num_warps),
+        )
+        return out
+
     _fast_accumulate_2d_input_slices_direct_final_kernel[grid](
         x0,
         g0,
@@ -5384,12 +6492,151 @@ def triton_fast_accumulate_2d_input_slices_direct_final(
         float(1.0 / (float(x_qmax) * float(mat_qmax))),
         dot_dtype,
         input_precision,
+        bool(binary_input_slices),
         int(block_r),
         int(block_l),
         int(block_k),
         num_r_blocks,
         num_l_blocks,
-        num_warps=4,
+        num_warps=int(num_warps),
+    )
+    return out
+
+
+def triton_fast_accumulate_2d_input_slices_direct_final_precomputed_v(
+    v_sliced: torch.Tensor,
+    g_shifted: torch.Tensor,
+    slice_scale: torch.Tensor,
+    x_max: torch.Tensor,
+    mat_max: torch.Tensor,
+    adc_ref: float,
+    radc: int,
+    *,
+    x_qmax: float,
+    mat_qmax: float,
+    input_precision: str = "ieee",
+    block_r: int = 32,
+    block_l: int = 16,
+    block_k: int = 64,
+    num_warps: int = 4,
+    out: torch.Tensor | None = None,
+    out_col_offset: int = 0,
+    out_cols: int | None = None,
+) -> torch.Tensor:
+    """Run direct-final accumulation from a precomputed input-voltage tensor.
+
+    The input tensor must already contain DAC voltages with shape
+    [N, M, I, J, K]. This path is intended for uniform 1-bit input slices,
+    where voltage is simply x_sliced * VREAD.
+    """
+    if triton is None:
+        raise RuntimeError(f"Triton fast accumulate is unavailable: {TRITON_IMPORT_ERROR}")
+    if v_sliced.dim() != 5:
+        raise ValueError("Precomputed-V direct-final expects v_sliced with shape [N, M, I, J, K].")
+    if g_shifted is None or g_shifted.dim() != 5:
+        raise ValueError("Precomputed-V direct-final expects conductance with shape [M, P, S, K, L].")
+    if x_max.dim() != 4 or mat_max.dim() != 4:
+        raise ValueError("Precomputed-V direct-final expects x_max/mat_max rank 4.")
+    if input_precision not in ("tf32", "tf32x3", "ieee"):
+        raise ValueError("input_precision must be 'tf32', 'tf32x3', or 'ieee'.")
+    if radc < 2:
+        raise ValueError("radc must be >= 2.")
+
+    v0 = v_sliced.contiguous()
+    g0 = g_shifted.contiguous()
+    scale = slice_scale.contiguous()
+    xm = x_max.contiguous()
+    mm = mat_max.contiguous()
+
+    n, m, i_count, j, k = v0.shape
+    gm, p, s, gk, l = g0.shape
+    if (gm, gk) != (m, k):
+        raise ValueError(f"Shape mismatch: v_sliced={tuple(v0.shape)}, g={tuple(g0.shape)}")
+    if tuple(xm.shape[:2]) != (n, m):
+        raise ValueError(f"x_max shape mismatch: v={tuple(v0.shape)}, x_max={tuple(xm.shape)}")
+    if tuple(mm.shape[:2]) != (m, p):
+        raise ValueError(f"mat_max shape mismatch: g={tuple(g0.shape)}, mat_max={tuple(mm.shape)}")
+    if tuple(scale.shape) != (i_count, s):
+        raise ValueError(f"slice_scale must have shape {(i_count, s)}; got {tuple(scale.shape)}.")
+
+    if out is None:
+        out = torch.zeros((n * j, p * l), device=v0.device, dtype=torch.float32)
+        out_col_offset = 0
+        out_cols = p * l
+    else:
+        if out.dim() != 2:
+            raise ValueError("External direct-final output buffer must be rank 2.")
+        if out.shape[0] != n * j:
+            raise ValueError(f"Output row mismatch: expected {n * j}, got {out.shape[0]}.")
+        if out.dtype != torch.float32:
+            raise ValueError("External direct-final output buffer must be float32.")
+        if out.device != v0.device:
+            raise ValueError("External direct-final output buffer must be on the same device.")
+        if out_cols is None:
+            out_cols = int(out.shape[1])
+        if int(out_cols) > int(out.shape[1]):
+            raise ValueError(f"out_cols={out_cols} exceeds output buffer width={out.shape[1]}.")
+        if int(out_col_offset) < 0 or int(out_col_offset) >= int(out_cols):
+            raise ValueError(
+                f"Output column offset out of bounds: offset={out_col_offset}, cols={out_cols}."
+            )
+
+    num_r_blocks = triton.cdiv(n * j, block_r)
+    num_l_blocks = triton.cdiv(l, block_l)
+    dot_dtype = (
+        2
+        if g0.dtype is torch.bfloat16 or v0.dtype is torch.bfloat16
+        else 1
+        if g0.dtype is torch.float16 or v0.dtype is torch.float16
+        else 0
+    )
+    grid = (num_r_blocks * m * p * num_l_blocks,)
+    _fast_accumulate_2d_input_slices_direct_final_precomputed_v_kernel[grid](
+        v0,
+        g0,
+        scale,
+        xm,
+        mm,
+        out,
+        v0.stride(0),
+        v0.stride(1),
+        v0.stride(2),
+        v0.stride(3),
+        v0.stride(4),
+        g0.stride(0),
+        g0.stride(1),
+        g0.stride(2),
+        g0.stride(3),
+        g0.stride(4),
+        scale.stride(0),
+        scale.stride(1),
+        xm.stride(0),
+        xm.stride(1),
+        mm.stride(0),
+        mm.stride(1),
+        out.stride(0),
+        out.stride(1),
+        int(out_col_offset),
+        int(out_cols),
+        n,
+        m,
+        i_count,
+        p,
+        j,
+        k,
+        l,
+        s,
+        float(adc_ref),
+        float(radc - 1),
+        float(1.0 / (float(x_qmax) * float(mat_qmax))),
+        dot_dtype,
+        input_precision,
+        int(block_r),
+        int(block_l),
+        int(block_k),
+        num_r_blocks,
+        num_l_blocks,
+        num_warps=int(num_warps),
     )
     return out
 

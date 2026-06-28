@@ -244,6 +244,9 @@ class LinearMem(nn.Module):
         })
 
     def _runtime_count(self, key, value=1):
+        engine = getattr(self, "engine", None)
+        if not bool(getattr(engine, "runtime_counters", True)):
+            return
         counters = getattr(self, '_runtime_counters', None)
         if counters is None:
             counters = {}
@@ -253,7 +256,13 @@ class LinearMem(nn.Module):
     def _runtime_add_ms(self, key, start):
         self._runtime_count(key, (time.perf_counter() - start) * 1000.0)
 
+    def _runtime_stage_timing_enabled(self):
+        engine = getattr(self, "engine", None)
+        return bool(getattr(engine, "runtime_stage_timing", False) or getattr(engine, "profile", False))
+
     def _runtime_stage_start(self):
+        if not self._runtime_stage_timing_enabled():
+            return None
         device = torch.device(getattr(self.engine, "device", "cpu"))
         if device.type == "cuda" and torch.cuda.is_available():
             try:
@@ -266,6 +275,8 @@ class LinearMem(nn.Module):
 
     def _runtime_stage_stop(self, token, count_key, ms_key):
         self._runtime_count(count_key)
+        if token is None:
+            return
         mode, start_event, start_wall = token
         end_wall = time.perf_counter()
         wall_ms = (end_wall - start_wall) * 1000.0
@@ -462,9 +473,47 @@ class LinearMem(nn.Module):
         total_positions = input_2d.shape[0]
 
         if max_positions >= total_positions:
+            if hasattr(self.engine, "schedule_mode0_restore_input_prefetch"):
+                self.engine.schedule_mode0_restore_input_prefetch(input_2d, self.weight_sliced)
             token_slice = self._runtime_stage_start()
             try:
-                input_sliced.slice_data_imp(self.engine, input_2d)
+                if hasattr(self.engine, "probe_activation_slice_reuse"):
+                    self.engine.probe_activation_slice_reuse(
+                        input_2d,
+                        self.input_slice_method,
+                        self.input_paral_size,
+                        self.input_quant_gran,
+                        getattr(self.engine, "mode", 0),
+                    )
+                cache_entry = (
+                    self.engine.lookup_activation_slice_cache(
+                        input_2d,
+                        self.input_slice_method,
+                        self.input_paral_size,
+                        self.input_quant_gran,
+                        getattr(self.engine, "mode", 0),
+                    )
+                    if hasattr(self.engine, "lookup_activation_slice_cache")
+                    else None
+                )
+                if cache_entry is not None:
+                    input_sliced.sliced_data = cache_entry["sliced_data"]
+                    input_sliced.max_data = cache_entry["max_data"]
+                    input_sliced.e_bias = cache_entry.get("e_bias")
+                    input_sliced.quantized_data = None
+                    input_sliced.shape = input_2d.shape
+                    input_sliced.activation_slice_fused = bool(cache_entry.get("activation_slice_fused", False))
+                else:
+                    input_sliced.slice_data_imp(self.engine, input_2d)
+                    if hasattr(self.engine, "store_activation_slice_cache"):
+                        self.engine.store_activation_slice_cache(
+                            input_2d,
+                            input_sliced,
+                            self.input_slice_method,
+                            self.input_paral_size,
+                            self.input_quant_gran,
+                            getattr(self.engine, "mode", 0),
+                        )
             finally:
                 self._runtime_stage_stop(token_slice, 'input_slice_count', 'input_slice_ms')
                 self._record_activation_slice_path(input_sliced)
@@ -484,7 +533,43 @@ class LinearMem(nn.Module):
                 x_chunk = input_2d[start:end, :]
                 token_slice = self._runtime_stage_start()
                 try:
-                    input_sliced.slice_data_imp(self.engine, x_chunk)
+                    if hasattr(self.engine, "probe_activation_slice_reuse"):
+                        self.engine.probe_activation_slice_reuse(
+                            x_chunk,
+                            self.input_slice_method,
+                            self.input_paral_size,
+                            self.input_quant_gran,
+                            getattr(self.engine, "mode", 0),
+                        )
+                    cache_entry = (
+                        self.engine.lookup_activation_slice_cache(
+                            x_chunk,
+                            self.input_slice_method,
+                            self.input_paral_size,
+                            self.input_quant_gran,
+                            getattr(self.engine, "mode", 0),
+                        )
+                        if hasattr(self.engine, "lookup_activation_slice_cache")
+                        else None
+                    )
+                    if cache_entry is not None:
+                        input_sliced.sliced_data = cache_entry["sliced_data"]
+                        input_sliced.max_data = cache_entry["max_data"]
+                        input_sliced.e_bias = cache_entry.get("e_bias")
+                        input_sliced.quantized_data = None
+                        input_sliced.shape = x_chunk.shape
+                        input_sliced.activation_slice_fused = bool(cache_entry.get("activation_slice_fused", False))
+                    else:
+                        input_sliced.slice_data_imp(self.engine, x_chunk)
+                        if hasattr(self.engine, "store_activation_slice_cache"):
+                            self.engine.store_activation_slice_cache(
+                                x_chunk,
+                                input_sliced,
+                                self.input_slice_method,
+                                self.input_paral_size,
+                                self.input_quant_gran,
+                                getattr(self.engine, "mode", 0),
+                            )
                 finally:
                     self._runtime_stage_stop(token_slice, 'input_slice_count', 'input_slice_ms')
                     self._record_activation_slice_path(input_sliced)
