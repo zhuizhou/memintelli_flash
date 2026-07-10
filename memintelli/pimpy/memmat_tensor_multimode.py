@@ -4454,17 +4454,46 @@ class DPETensorMultiMode(object):
                 )
             else:
                 raise ValueError("Input data must be 2-D or 3-D.")
-            if partial.dtype != self.adc_compute_dtype:
-                partial = partial.to(self.adc_compute_dtype)
-            partial.div_(adc_ref)
-            partial.mul_(self.radc - 1)
-            partial.round_()
-            partial.div_(self.radc - 1)
-            partial.mul_(slice_scale_row[weight_slice])
-            if accumulated is None:
-                accumulated = partial
-            else:
-                accumulated.add_(partial)
+            accumulated = self._strict_adc_scale_accumulate(
+                partial,
+                slice_scale_row[weight_slice],
+                adc_ref,
+                accumulated,
+            )
+        return accumulated
+
+    def _strict_adc_scale_accumulate(
+        self,
+        partial,
+        scale,
+        adc_ref,
+        accumulated,
+    ):
+        if partial.is_cuda and scale.is_cuda:
+            try:
+                from .triton_fast_accumulate import triton_strict_adc_scale_accumulate
+
+                output = triton_strict_adc_scale_accumulate(
+                    partial,
+                    scale,
+                    accumulated,
+                    adc_ref=adc_ref,
+                    radc=int(self.radc),
+                )
+                self._fastpath_count("strict_adc_scale_accumulate_triton_success_count")
+                return output
+            except Exception:
+                self._fastpath_count("strict_adc_scale_accumulate_triton_fallback_count")
+        if partial.dtype != self.adc_compute_dtype:
+            partial = partial.to(self.adc_compute_dtype)
+        partial.div_(adc_ref)
+        partial.mul_(self.radc - 1)
+        partial.round_()
+        partial.div_(self.radc - 1)
+        partial.mul_(scale)
+        if accumulated is None:
+            return partial
+        accumulated.add_(partial)
         return accumulated
 
     def _strict_grouped_noisy_weight_slice_accumulate(
@@ -4475,6 +4504,7 @@ class DPETensorMultiMode(object):
         adc_ref,
         *,
         reduce_weight_slices=True,
+        defer_postprocess=False,
     ):
         self._fastpath_count("strict_grouped_noisy_vmm_attempt_count")
         if len(vin.shape) == 4:
@@ -4498,6 +4528,9 @@ class DPETensorMultiMode(object):
         else:
             raise ValueError("Input data must be 2-D or 3-D.")
 
+        if defer_postprocess:
+            self._fastpath_count("strict_grouped_noisy_vmm_success_count")
+            return partial
         if partial.dtype != self.adc_compute_dtype:
             partial = partial.to(self.adc_compute_dtype)
         if scale_view.dtype != self.adc_compute_dtype:
@@ -5826,13 +5859,16 @@ class DPETensorMultiMode(object):
                                         slice_scale[i, group_start:group_end],
                                         adcRef,
                                         reduce_weight_slices=False,
+                                        defer_postprocess=True,
                                     )
                                     for local_slice in range(group_end - group_start):
                                         grouped_partial = grouped_partials.select(-3, local_slice)
-                                        if accumulated is None:
-                                            accumulated = grouped_partial.clone()
-                                        else:
-                                            accumulated.add_(grouped_partial)
+                                        accumulated = self._strict_adc_scale_accumulate(
+                                            grouped_partial,
+                                            slice_scale[i, group_start + local_slice],
+                                            adcRef,
+                                            accumulated,
+                                        )
                                     del grouped_partials
                             else:
                                 accumulated = self._strict_serial_noisy_weight_slice_accumulate(

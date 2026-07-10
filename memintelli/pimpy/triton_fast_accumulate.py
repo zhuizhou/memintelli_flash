@@ -414,6 +414,40 @@ if triton is not None:
 
 
     @triton.jit
+    def _add_rn_fp32(a, b):
+        return tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            [a, b],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+
+    @triton.jit
+    def _strict_adc_scale_accumulate_kernel(
+        partial,
+        scale,
+        accumulated,
+        total,
+        ADC_REF: tl.constexpr,
+        RADC_SCALE: tl.constexpr,
+        HAS_ACCUMULATED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < total
+        value = tl.load(partial + offsets, mask=mask, other=0.0).to(tl.float32)
+        value = _round_even(value / ADC_REF * RADC_SCALE) / RADC_SCALE
+        value *= tl.load(scale).to(tl.float32)
+        if HAS_ACCUMULATED:
+            previous = tl.load(accumulated + offsets, mask=mask, other=0.0)
+            value = _add_rn_fp32(previous, value)
+        tl.store(accumulated + offsets, value, mask=mask)
+
+
+    @triton.jit
     def _slice_mode0_2d_uniform1_kernel(
         x,
         sliced,
@@ -7002,6 +7036,46 @@ if triton is not None:
                 tile_total,
                 mask=mask_r[:, None] & mask_l[None, :],
             )
+
+
+def triton_strict_adc_scale_accumulate(
+    partial: torch.Tensor,
+    scale: torch.Tensor,
+    accumulated: torch.Tensor | None,
+    *,
+    adc_ref: float,
+    radc: int,
+    block: int = 256,
+) -> torch.Tensor:
+    if triton is None:
+        raise RuntimeError(f"Triton fast accumulate is unavailable: {TRITON_IMPORT_ERROR}")
+    if not partial.is_cuda or not scale.is_cuda:
+        raise ValueError("Strict ADC-scale accumulation requires CUDA tensors.")
+    if not partial.is_contiguous():
+        partial = partial.contiguous()
+    if accumulated is None:
+        accumulated = torch.empty(partial.shape, device=partial.device, dtype=torch.float32)
+        has_accumulated = False
+    else:
+        if accumulated.shape != partial.shape or accumulated.dtype != torch.float32:
+            raise ValueError("Accumulated output must be contiguous FP32 with the partial shape.")
+        if not accumulated.is_contiguous():
+            raise ValueError("Accumulated output must be contiguous.")
+        has_accumulated = True
+    total = partial.numel()
+    grid = (triton.cdiv(total, block),)
+    _strict_adc_scale_accumulate_kernel[grid](
+        partial,
+        scale,
+        accumulated,
+        total,
+        float(adc_ref),
+        float(int(radc) - 1),
+        bool(has_accumulated),
+        int(block),
+        num_warps=4,
+    )
+    return accumulated
 
 
 def triton_restore_gidx_read_noise(
