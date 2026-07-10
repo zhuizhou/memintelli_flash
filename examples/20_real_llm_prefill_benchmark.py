@@ -1792,6 +1792,49 @@ def build_mem_linear_for_source(LinearMem, args, engine, source, device, support
     return target
 
 
+def build_coalesced_mem_linear(
+    LinearMem,
+    args,
+    engine,
+    projections,
+    device,
+    supports_skip,
+    *,
+    output_align=1,
+):
+    first = projections[0]
+    align = max(1, int(output_align))
+    out_splits = [int(layer.out_features) for layer in projections]
+    padded_splits = [int(math.ceil(size / align) * align) for size in out_splits]
+    out_offsets = []
+    offset = 0
+    for padded in padded_splits:
+        out_offsets.append(offset)
+        offset += padded
+
+    fused_weight = first.weight.detach().new_zeros((offset, int(first.in_features)))
+    fused_bias = first.bias.detach().new_zeros((offset,)) if first.bias is not None else None
+    for layer, start, size in zip(projections, out_offsets, out_splits):
+        fused_weight[start:start + size].copy_(layer.weight.detach())
+        if fused_bias is not None:
+            fused_bias[start:start + size].copy_(layer.bias.detach())
+    source = argparse.Namespace(
+        in_features=int(first.in_features),
+        out_features=int(offset),
+        weight=fused_weight,
+        bias=fused_bias,
+    )
+    inner = build_mem_linear_for_source(
+        LinearMem,
+        args,
+        engine,
+        source,
+        device,
+        supports_skip,
+    )
+    return inner, out_splits, padded_splits, out_offsets
+
+
 class FusedGateUpLinearMem(nn.Module):
     def __init__(self, LinearMem, args, engine, gate, up, device, supports_skip):
         super().__init__()
@@ -1805,37 +1848,27 @@ class FusedGateUpLinearMem(nn.Module):
         self.up_out_features = int(up.out_features)
         self.in_features = int(gate.in_features)
         self.out_features = self.gate_out_features + self.up_out_features
-        inners = []
-        for layer in (gate, up):
-            inner = build_mem_linear_for_source(
-                LinearMem,
-                args,
-                engine,
-                layer,
-                device,
-                supports_skip,
-            )
-            inners.append(inner)
-        self.inners = nn.ModuleList(inners)
+        self.inner, _, _, _ = build_coalesced_mem_linear(
+            LinearMem,
+            args,
+            engine,
+            [gate, up],
+            device,
+            supports_skip,
+        )
+        object.__setattr__(self, "_gate_bias", gate.bias)
+        object.__setattr__(self, "_up_bias", up.bias)
         self._cache_key = None
         self._cache_gate = None
         self._cache_up = None
 
     @property
-    def gate_inner(self):
-        return self.inners[0]
-
-    @property
-    def up_inner(self):
-        return self.inners[1]
-
-    @property
     def weight_sliced(self):
-        return self.gate_inner.weight_sliced
+        return self.inner.weight_sliced
 
     @property
     def engine(self):
-        return self.gate_inner.engine
+        return self.inner.engine
 
     def _input_key(self, input):
         return (id(input), tuple(input.shape), int(input.data_ptr()))
@@ -1846,7 +1879,8 @@ class FusedGateUpLinearMem(nn.Module):
         self._cache_up = None
 
     def _run_group(self, input):
-        return self.gate_inner(input), self.up_inner(input)
+        fused = self.inner(input)
+        return torch.split(fused, [self.gate_out_features, self.up_out_features], dim=-1)
 
     def gate(self, input):
         key = self._input_key(input)
@@ -1873,13 +1907,12 @@ class FusedGateUpLinearMem(nn.Module):
         return up
 
     def enable_lazy_inference(self, streaming=False, free_weights=False, release_after_forward=True):
-        for inner in self.inners:
-            if hasattr(inner, "enable_lazy_inference"):
-                inner.enable_lazy_inference(
-                    streaming=streaming,
-                    free_weights=free_weights,
-                    release_after_forward=release_after_forward,
-                )
+        if hasattr(self.inner, "enable_lazy_inference"):
+            self.inner.enable_lazy_inference(
+                streaming=streaming,
+                free_weights=free_weights,
+                release_after_forward=release_after_forward,
+            )
         return self
 
 
@@ -1889,7 +1922,7 @@ class GateProjectionView(nn.Module):
         object.__setattr__(self, "_owner", owner)
         self.in_features = owner.in_features
         self.out_features = owner.gate_out_features
-        self.bias = owner.gate_inner.bias
+        self.bias = owner._gate_bias
 
     @property
     def weight_sliced(self):
@@ -1909,7 +1942,7 @@ class UpProjectionView(nn.Module):
         object.__setattr__(self, "_owner", owner)
         self.in_features = owner.in_features
         self.out_features = owner.up_out_features
-        self.bias = owner.up_inner.bias
+        self.bias = owner._up_bias
 
     @property
     def weight_sliced(self):
@@ -1938,36 +1971,29 @@ class FusedProjectionGroupLinearMem(nn.Module):
             if (layer.bias is not None) != first_bias:
                 raise ValueError("Fused projections must either all have bias or all omit bias.")
         self.names = [name for name, _ in projections]
-        self.out_splits = [int(layer.out_features) for _, layer in projections]
-        self.out_offsets = []
-        offset = 0
-        for size in self.out_splits:
-            self.out_offsets.append(offset)
-            offset += int(size)
+        layers = [layer for _, layer in projections]
         self.in_features = int(first_layer.in_features)
-        self.out_features = int(sum(self.out_splits))
-        inners = []
-        for _, layer in projections:
-            inner = build_mem_linear_for_source(
-                LinearMem,
-                args,
-                engine,
-                layer,
-                device,
-                supports_skip,
-            )
-            inners.append(inner)
-        self.inners = nn.ModuleList(inners)
+        self.inner, self.out_splits, self.padded_splits, self.out_offsets = build_coalesced_mem_linear(
+            LinearMem,
+            args,
+            engine,
+            layers,
+            device,
+            supports_skip,
+            output_align=output_align or 1,
+        )
+        self.out_features = int(sum(self.padded_splits))
+        object.__setattr__(self, "_projection_biases", [layer.bias for layer in layers])
         self._cache_key = None
         self._cache_outputs = None
 
     @property
     def weight_sliced(self):
-        return self.inners[0].weight_sliced
+        return self.inner.weight_sliced
 
     @property
     def engine(self):
-        return self.inners[0].engine
+        return self.inner.engine
 
     def _input_key(self, input):
         return (id(input), tuple(input.shape), int(input.data_ptr()))
@@ -1981,7 +2007,11 @@ class FusedProjectionGroupLinearMem(nn.Module):
         if self._cache_key != key or self._cache_outputs is None or self._cache_outputs[index] is None:
             self._clear_cache()
             self._cache_key = key
-            self._cache_outputs = [inner(input) for inner in self.inners]
+            fused = self.inner(input)
+            self._cache_outputs = [
+                fused.narrow(-1, start, size)
+                for start, size in zip(self.out_offsets, self.out_splits)
+            ]
         out = self._cache_outputs[index]
         self._cache_outputs[index] = None
         if all(item is None for item in self._cache_outputs):
@@ -1989,13 +2019,12 @@ class FusedProjectionGroupLinearMem(nn.Module):
         return out
 
     def enable_lazy_inference(self, streaming=False, free_weights=False, release_after_forward=True):
-        for inner in self.inners:
-            if hasattr(inner, "enable_lazy_inference"):
-                inner.enable_lazy_inference(
-                    streaming=streaming,
-                    free_weights=free_weights,
-                    release_after_forward=release_after_forward,
-                )
+        if hasattr(self.inner, "enable_lazy_inference"):
+            self.inner.enable_lazy_inference(
+                streaming=streaming,
+                free_weights=free_weights,
+                release_after_forward=release_after_forward,
+            )
         return self
 
 
@@ -2006,7 +2035,7 @@ class FusedProjectionView(nn.Module):
         self.index = int(index)
         self.in_features = owner.in_features
         self.out_features = owner.out_splits[self.index]
-        self.bias = owner.inners[self.index].bias
+        self.bias = owner._projection_biases[self.index]
 
     @property
     def weight_sliced(self):
@@ -2159,8 +2188,19 @@ def can_fuse_common_input_projection_group(args, linears):
         return False
     if not linears:
         return False
+    if float(getattr(args, "write_variation", 0.0) or 0.0) != 0.0:
+        return False
+    if (
+        float(getattr(args, "read_variation", 0.0) or 0.0) > 0.0
+        and getattr(args, "read_variation_seed", None) is not None
+    ):
+        return False
+    if tuple(int(v) for v in getattr(args, "weight_quant_gran", ())) != tuple(
+        int(v) for v in getattr(args, "weight_paral_size", ())
+    ):
+        return False
     first = linears[0]
-    return all(
+    return projection_group_preserves_weight_quant(args, linears) and all(
         int(layer.in_features) == int(first.in_features)
         and layer.weight.dtype == first.weight.dtype
         and (layer.bias is None) == (first.bias is None)
@@ -2260,6 +2300,7 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
         and hasattr(module, "up_proj")
         and isinstance(module.gate_proj, nn.Linear)
         and isinstance(module.up_proj, nn.Linear)
+        and can_fuse_common_input_projection_group(args, [module.gate_proj, module.up_proj])
     ):
         gate_name = f"{prefix}.gate_proj" if prefix else "gate_proj"
         up_name = f"{prefix}.up_proj" if prefix else "up_proj"
@@ -2486,7 +2527,7 @@ def apply_worker_s2_stage(args):
     args.triton_direct_output_zero_once = False
     args.fuse_mlp_gate_up = stage == "full"
     args.fuse_common_input_projections = stage == "full"
-    args.triton_activation_slice_cache = stage == "full"
+    args.triton_activation_slice_cache = False
     if args.fast_inference_backend == "auto":
         args.fast_inference_backend = "triton_gidx" if fast_inference else "torch"
     return args
@@ -3292,7 +3333,7 @@ def main():
     parser.add_argument("--weight-paral-size", type=int, nargs=2, default=[64, 64])
     parser.add_argument("--input-quant-gran", type=int, nargs=2, default=[1, 64])
     parser.add_argument("--weight-quant-gran", type=int, nargs=2, default=[64, 64])
-    parser.add_argument("--inference-chunk-size", type=int, default=8 * 1024 * 1024)
+    parser.add_argument("--inference-chunk-size", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--cuda-memory-fraction", type=float, default=0.0)
     parser.add_argument("--collect-layer-buffer-accounting", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--layer-buffer-accounting-limit", type=int, default=12)
@@ -4559,7 +4600,7 @@ def apply_s2_stage(args):
     args.triton_direct_output_zero_once = False
     args.fuse_mlp_gate_up = stage == "full"
     args.fuse_common_input_projections = stage == "full"
-    args.triton_activation_slice_cache = stage == "full"
+    args.triton_activation_slice_cache = False
     if getattr(args, "fast_inference_backend", "auto") == "auto":
         args.fast_inference_backend = "triton_gidx" if fast_inference else "torch"
     return args, fast_inference
@@ -5590,7 +5631,7 @@ def parse_args():
     parser.add_argument("--weight-paral-size", type=int, nargs=2, default=[64, 64])
     parser.add_argument("--input-quant-gran", type=int, nargs=2, default=[1, 64])
     parser.add_argument("--weight-quant-gran", type=int, nargs=2, default=[64, 64])
-    parser.add_argument("--inference-chunk-size", type=int, default=8 * 1024 * 1024)
+    parser.add_argument("--inference-chunk-size", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--cuda-memory-fraction", type=float, default=0.0)
     parser.add_argument("--collect-layer-buffer-accounting", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--layer-buffer-accounting-limit", type=int, default=12)

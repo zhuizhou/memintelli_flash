@@ -68,7 +68,7 @@ def test_s2_full_adds_common_input_projection_coalescing():
     assert args.triton_direct_final_exact_reduce is True
     assert args.fuse_mlp_gate_up is True
     assert args.fuse_common_input_projections is True
-    assert args.triton_activation_slice_cache is True
+    assert args.triton_activation_slice_cache is False
 
 
 def test_s1_stages_form_resident_block_budgeted_hierarchy():
@@ -203,5 +203,6 @@ def test_launcher_parser_exposes_independent_s1_s2_controls():
     assert args.cuda_peak_budget_mb == 20000.0
     assert args.state_resident_budget_mb == 0.0
     assert args.output_block_cols == 16384
+    assert args.inference_chunk_size == 16 * 1024 * 1024
     assert args.fuse_mlp_gate_up is False
     assert args.fuse_common_input_projections is False

@@ -130,7 +130,7 @@ def test_worker_counts_only_non_linear_resident_model_bytes():
     assert worker["estimate_non_linear_model_bytes"](model) == expected
 
 
-def test_common_input_coalescing_accepts_seeded_read_variation():
+def test_common_input_coalescing_rejects_seeded_read_variation_reference_runs():
     module = load_benchmark_module()
     worker = {"__name__": "worker_test"}
     transformers = types.ModuleType("transformers")
@@ -154,7 +154,7 @@ def test_common_input_coalescing_accepts_seeded_read_variation():
         nn.Linear(128, 64, bias=False),
     ]
 
-    assert worker["can_fuse_common_input_projection_group"](args, linears) is True
+    assert worker["can_fuse_common_input_projection_group"](args, linears) is False
 
 
 def test_common_input_group_keeps_independent_weight_mappings():
@@ -213,11 +213,9 @@ def test_common_input_group_keeps_independent_weight_mappings():
     q_out = owner.project(0, value)
     k_out = owner.project(1, value)
 
-    assert len(owner.inners) == 2
-    assert torch.equal(owner.inners[0].weight, q.weight)
-    assert torch.equal(owner.inners[1].weight, k.weight)
-    assert owner.inners[0].call_count == 1
-    assert owner.inners[1].call_count == 1
+    assert owner.inner.call_count == 1
+    assert torch.equal(owner.inner.weight[:4], q.weight)
+    assert torch.equal(owner.inner.weight[4:6], k.weight)
     torch.testing.assert_close(q_out, q(value), rtol=0.0, atol=1e-6)
     torch.testing.assert_close(k_out, k(value), rtol=0.0, atol=1e-6)
 
@@ -277,8 +275,36 @@ def test_common_input_group_preserves_s1_output_blocking():
         True,
     )
 
-    assert owner.inners[0].shard_count == 3
-    assert owner.inners[1].shard_count == 2
+    assert owner.inner.shard_count == 4
+
+
+def test_physical_projection_coalescing_requires_compatible_mapping_and_noise_policy():
+    module = load_benchmark_module()
+    worker = {"__name__": "worker_test"}
+    transformers = types.ModuleType("transformers")
+    transformers.AutoConfig = object
+    transformers.AutoTokenizer = object
+    with mock.patch.dict(sys.modules, {"transformers": transformers}):
+        exec(module.WORKER_CODE, worker)
+
+    args = argparse.Namespace(
+        kind="v3",
+        mode=0,
+        write_variation=0.0,
+        read_variation=0.05,
+        read_variation_seed=None,
+        weight_quant_gran=[64, 64],
+        weight_paral_size=[64, 64],
+    )
+    aligned = [nn.Linear(64, 128, bias=False), nn.Linear(64, 64, bias=False)]
+    unaligned = [nn.Linear(64, 96, bias=False), nn.Linear(64, 64, bias=False)]
+
+    can_fuse = worker["can_fuse_common_input_projection_group"]
+    assert can_fuse(args, aligned) is True
+    assert can_fuse(args, unaligned) is False
+
+    args.read_variation_seed = 1234
+    assert can_fuse(args, aligned) is False
 
 
 def test_worker_replaces_a_non_lm_head_with_output_blocks():

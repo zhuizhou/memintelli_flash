@@ -22,6 +22,7 @@ def make_engine(*, exact_reduce):
     engine._mode0_vmm_uses_low_precision_override = lambda: True
     engine._mode0_fast_policy_requested = lambda: False
     engine._mode0_seeded_semantic_audit = lambda: True
+    engine._mode0_analog_compute_dtype = lambda: torch.bfloat16
     engine._fastpath_count = lambda *args, **kwargs: None
     return engine
 
@@ -57,6 +58,19 @@ def test_seeded_noisy_g_allows_the_exact_fast_inference_entrypoint():
     engine = make_engine(exact_reduce=True)
 
     assert engine._can_use_fast_inference(differential_input=False) is True
+
+
+def test_seeded_noisy_g_keeps_exact_direct_final_enabled_by_default():
+    engine = make_engine(exact_reduce=True)
+
+    assert engine._requires_strict_grouped_noisy_vmm() is False
+
+
+def test_framework_noisy_vmm_reference_is_explicitly_opt_in():
+    engine = make_engine(exact_reduce=True)
+    engine.mode0_framework_noisy_vmm_reference = True
+
+    assert engine._requires_strict_grouped_noisy_vmm() is True
 
 
 def test_seeded_strict_restore_repeats_after_noise_state_reset():

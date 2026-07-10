@@ -4415,8 +4415,11 @@ class DPETensorMultiMode(object):
         return out
 
     def _requires_strict_grouped_noisy_vmm(self):
+        # This is a diagnostic PyTorch/cuBLAS arithmetic reference, not the
+        # default semantics-preserving CIM execution path.
         return (
-            self.mode == 0
+            bool(getattr(self, "mode0_framework_noisy_vmm_reference", False))
+            and self.mode == 0
             and bool(getattr(self, "_has_read_noise", False))
             and bool(getattr(self, "triton_direct_final_exact_reduce", False))
             and self._mode0_analog_compute_dtype() in (torch.float16, torch.bfloat16)
