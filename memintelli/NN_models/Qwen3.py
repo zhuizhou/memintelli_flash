@@ -8,7 +8,7 @@ from typing import Optional, Union, Any
 import torch
 import torch.nn as nn
 
-from memintelli.NN_layers import LinearMem
+from memintelli.NN_layers import LinearMem, tensor_bytes
 
 try:
     from transformers import AutoModelForCausalLM
@@ -155,8 +155,7 @@ class Qwen3MemWrapper(nn.Module):
             sz = 0
             for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
                 t = m._pinned_buffers.get(attr)
-                if t is not None:
-                    sz += t.nelement() * t.element_size()
+                sz += tensor_bytes(t)
             layer_g_sizes.append(sz)
             total_g_bytes += sz
         

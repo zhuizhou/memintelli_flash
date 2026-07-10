@@ -828,3 +828,14 @@ if __name__ == '__main__':
             plt.scatter(rel_result.reshape(-1), result.reshape(-1))
             plt.xlabel('Expected Value of Dot Product')
             plt.ylabel('Measured Value of Dot Product')
+
+
+# v3 canonical backend: keep the historical DPETensor symbol, but implement it
+# as DPETensorMultiMode(mode=0). This avoids maintaining two optimization paths.
+from memintelli.pimpy.memmat_tensor_multimode import DPETensorMultiMode as _DPETensorMultiMode
+
+
+class DPETensor(_DPETensorMultiMode):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("mode", 0)
+        super().__init__(*args, **kwargs)

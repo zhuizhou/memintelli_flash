@@ -111,8 +111,8 @@ def bfp_map_tensor(mat, blk, max_abs_temp_mat=None, skip_quantized=False):
     e_bias = torch.floor(torch.log2(max_mat + 1e-10))
     matq = mat / 2. ** e_bias
     matq = torch.round(matq * 2. ** (bits - 2))
-    clip_up = (2 ** (bits - 1) - 1).to(mat.device)
-    clip_down = (-2 ** (bits - 1)).to(mat.device)
+    clip_up = 2 ** (bits - 1) - 1
+    clip_down = -2 ** (bits - 1)
     matq = torch.clip(matq, clip_down, clip_up)  # round & clip，clip到-2^(bits-1) ~ 2^(bits-1)-1
     mat_data = None if skip_quantized else (matq * 2. ** (e_bias + 2 - bits))  # dequantized data for backward
     # Convert to two's complement: bitwise AND is zero-extra-memory
