@@ -98,3 +98,21 @@ def test_analytical_residency_does_not_prepare_rejected_candidates():
     assert large.prepare_count == 1
     assert small.prepare_count == 0
     assert info["memory_resident_layers"] == 1
+
+
+def test_offload_helper_supports_v2_and_v3_method_signatures():
+    worker = load_worker_namespace()
+    calls = []
+
+    class V2Module:
+        def _offload_to_cpu(self):
+            calls.append(("v2", None))
+
+    class V3Module:
+        def _offload_to_cpu(self, pin_policy=None):
+            calls.append(("v3", pin_policy))
+
+    worker["offload_module_to_cpu"](V2Module(), pin_policy="window")
+    worker["offload_module_to_cpu"](V3Module(), pin_policy="persistent")
+
+    assert calls == [("v2", None), ("v3", "persistent")]

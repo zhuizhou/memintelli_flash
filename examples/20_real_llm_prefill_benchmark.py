@@ -2707,6 +2707,17 @@ def set_lazy_module_common(module, args, module_device, *, release_after_forward
         module.weight_slice_method = module.weight_slice_method.to(module_device)
 
 
+def offload_module_to_cpu(module, *, pin_policy):
+    method = module._offload_to_cpu
+    try:
+        supports_pin_policy = "pin_policy" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        supports_pin_policy = False
+    if supports_pin_policy:
+        return method(pin_policy=pin_policy)
+    return method()
+
+
 def prepare_mem_model(model, LinearMem, args, device):
     cache_budget_mb = float(getattr(args, "streaming_window_pin_cache_mb", 0.0) or 0.0)
     cache_budget_bytes = int(cache_budget_mb * (1024 ** 2)) if cache_budget_mb > 0.0 else 0
@@ -2935,7 +2946,7 @@ def prepare_mem_model(model, LinearMem, args, device):
                             pin_budget_used_bytes += layer_bytes
                         else:
                             pin_policy = "window"
-                module._offload_to_cpu(pin_policy=pin_policy)
+                offload_module_to_cpu(module, pin_policy=pin_policy)
                 object.__setattr__(module, "_streaming", True)
             if args.streaming_pin_policy == "persistent" and pin_budget_bytes > 0 and pin_select == "largest" and not keep_gpu_resident:
                 largest_pin_candidates.append((layer_stream_bytes, module_index, module))
@@ -2947,12 +2958,12 @@ def prepare_mem_model(model, LinearMem, args, device):
         pin_budget_used_bytes = 0
         for layer_bytes, _module_index, module in sorted(largest_pin_candidates, reverse=True):
             if layer_bytes and pin_budget_used_bytes + layer_bytes <= pin_budget_bytes:
-                module._offload_to_cpu(pin_policy="persistent")
+                offload_module_to_cpu(module, pin_policy="persistent")
                 pin_budget_used_bytes += layer_bytes
     elif args.streaming and args.streaming_pin_policy == "persistent" and pin_budget_bytes > 0 and pin_select == "runtime":
         for module_name, module in named_layers:
             if module_name in runtime_pin_names and module_name not in resident_names and bool(getattr(module, "_streaming", False)):
-                module._offload_to_cpu(pin_policy="persistent")
+                offload_module_to_cpu(module, pin_policy="persistent")
 
     streaming_layers = 0
     if supports_inference and args.streaming:
