@@ -1154,6 +1154,69 @@ class ModuleTimingContext:
         }
 
 
+class LayerPeakTraceContext:
+    def __init__(self, model, LinearMem, enabled=False):
+        self.model = model
+        self.LinearMem = LinearMem
+        self.enabled = bool(enabled and LinearMem is not None and torch.cuda.is_available())
+        self.handles = []
+        self.rows = []
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        for name, module in self.model.named_modules():
+            if not isinstance(module, self.LinearMem):
+                continue
+            module_name = name or "<root>"
+            self.handles.append(module.register_forward_pre_hook(self._pre_hook(module_name)))
+            self.handles.append(module.register_forward_hook(self._post_hook(module_name)))
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    @staticmethod
+    def _device(module):
+        engine = getattr(module, "engine", None)
+        return torch.device(getattr(engine, "device", "cuda"))
+
+    def _pre_hook(self, name):
+        def hook(module, _inputs):
+            device = self._device(module)
+            torch.cuda.synchronize(device)
+            allocated_before = int(torch.cuda.memory_allocated(device))
+            torch.cuda.reset_peak_memory_stats(device)
+            object.__setattr__(module, "_memintelli_layer_peak_trace", allocated_before)
+
+        return hook
+
+    def _post_hook(self, name):
+        def hook(module, _inputs, _output):
+            device = self._device(module)
+            torch.cuda.synchronize(device)
+            peak = int(torch.cuda.max_memory_allocated(device))
+            allocated_after = int(torch.cuda.memory_allocated(device))
+            allocated_before = int(getattr(module, "_memintelli_layer_peak_trace", 0) or 0)
+            self.rows.append(
+                {
+                    "index": len(self.rows),
+                    "name": name,
+                    "in_features": int(getattr(module, "in_features", 0) or 0),
+                    "out_features": int(getattr(module, "out_features", 0) or 0),
+                    "allocated_before_bytes": allocated_before,
+                    "allocated_after_bytes": allocated_after,
+                    "peak_bytes": peak,
+                    "incremental_peak_bytes": max(0, peak - allocated_before),
+                }
+            )
+            object.__setattr__(module, "_memintelli_layer_peak_trace", 0)
+
+        return hook
+
+
 class SemanticOutputProbe:
     def __init__(self, model, LinearMem, enabled=False):
         self.model = model
@@ -3721,6 +3784,7 @@ def main():
         logits = None
         module_timing_summaries = []
         semantic_probe_rows = []
+        layer_peak_trace_rows = []
         for _ in range(max(1, args.repeat)):
             if args.kind != "hf" and args.profile:
                 reset_engine_profiles(model, LinearMem)
@@ -3729,14 +3793,20 @@ def main():
             t0 = time.perf_counter()
             if args.cuda_profiler_capture:
                 cuda_profiler_start(device)
-            with SemanticOutputProbe(
+            with LayerPeakTraceContext(
                 model,
                 LinearMem,
-                enabled=os.environ.get("MEMINTELLI_SEMANTIC_PROBE", "0") == "1",
-            ) as semantic_probe:
-                with ModuleTimingContext(model, LinearMem, enabled=args.module_timing) as module_timing:
-                    logits, prefill_ms, decode_ms = run_workload_once()
+                enabled=os.environ.get("MEMINTELLI_LAYER_PEAK_TRACE", "0") == "1",
+            ) as layer_peak_trace:
+                with SemanticOutputProbe(
+                    model,
+                    LinearMem,
+                    enabled=os.environ.get("MEMINTELLI_SEMANTIC_PROBE", "0") == "1",
+                ) as semantic_probe:
+                    with ModuleTimingContext(model, LinearMem, enabled=args.module_timing) as module_timing:
+                        logits, prefill_ms, decode_ms = run_workload_once()
             semantic_probe_rows.extend(semantic_probe.rows)
+            layer_peak_trace_rows.extend(layer_peak_trace.rows)
             sync(device)
             if args.cuda_profiler_capture:
                 cuda_profiler_stop(device)
@@ -4040,6 +4110,10 @@ def main():
         "semantic_output_probe": {
             "enabled": bool(semantic_probe_rows),
             "rows": semantic_probe_rows,
+        },
+        "layer_peak_trace": {
+            "enabled": bool(layer_peak_trace_rows),
+            "rows": layer_peak_trace_rows,
         },
         "load_peak_mb": load_peak,
         "prepare_peak_mb": prepare_peak,
