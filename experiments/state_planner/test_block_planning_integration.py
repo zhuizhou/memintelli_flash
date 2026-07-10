@@ -52,6 +52,26 @@ def test_s1_off_never_blocks_a_linear():
     assert plan.shard_count == 1
 
 
+def test_worker_s1_off_does_not_require_the_v3_state_planner_module():
+    module = load_benchmark_module()
+    worker = {"__name__": "worker_test"}
+    transformers = types.ModuleType("transformers")
+    transformers.AutoConfig = object
+    transformers.AutoTokenizer = object
+    with mock.patch.dict(sys.modules, {"transformers": transformers}):
+        exec(module.WORKER_CODE, worker)
+
+    layer = nn.Linear(2560, 248320, bias=False)
+    with mock.patch.dict(sys.modules, {"memintelli.NN_layers.state_planner": None}):
+        plan = worker["plan_linear_output_blocks"](
+            planner_args("off", cuda_budget_mb=4096.0),
+            layer,
+        )
+
+    assert plan.output_block_cols == layer.out_features
+    assert plan.shard_count == 1
+
+
 def test_s1_block_uses_only_the_manual_debug_override():
     module = load_benchmark_module()
     layer = nn.Linear(2560, 248320, bias=False)

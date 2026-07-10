@@ -1380,10 +1380,22 @@ def linearmem_kwargs(LinearMem, args, engine, child, device, supports_skip):
 
 
 def plan_linear_output_blocks(args, child, manual_shard_count=0):
-    from memintelli.NN_layers.state_planner import plan_output_block
-
     stage = str(getattr(args, "s1_stage", "off") or "off")
     block_addressable = bool(getattr(args, "s1_block_addressable", stage != "off"))
+    if not block_addressable:
+        return argparse.Namespace(
+            output_block_cols=int(child.out_features),
+            shard_count=1,
+            estimated_peak_mb=0.0,
+            workspace_budget_mb=0.0,
+            base_allocated_mb=0.0,
+            resident_state_mb=0.0,
+            safety_margin_mb=0.0,
+            manual_override=False,
+        )
+
+    from memintelli.NN_layers.state_planner import plan_output_block
+
     planner_enabled = str(getattr(args, "state_planner", "off")) == "analytical"
     manual_cols = int(getattr(args, "output_block_cols", 0) or 0) if block_addressable else 0
     if block_addressable and not manual_cols and int(manual_shard_count or 0) > 1:
@@ -4363,10 +4375,22 @@ def apply_launcher_execution_mode_defaults(args):
 
 
 def plan_linear_output_blocks(args, child, manual_shard_count=0):
-    from memintelli.NN_layers.state_planner import plan_output_block
-
     stage = str(getattr(args, "s1_stage", "off") or "off")
     block_addressable = bool(getattr(args, "s1_block_addressable", stage != "off"))
+    if not block_addressable:
+        return argparse.Namespace(
+            output_block_cols=int(child.out_features),
+            shard_count=1,
+            estimated_peak_mb=0.0,
+            workspace_budget_mb=0.0,
+            base_allocated_mb=0.0,
+            resident_state_mb=0.0,
+            safety_margin_mb=0.0,
+            manual_override=False,
+        )
+
+    from memintelli.NN_layers.state_planner import plan_output_block
+
     planner_enabled = str(getattr(args, "state_planner", "off")) == "analytical"
     manual_cols = int(getattr(args, "output_block_cols", 0) or 0) if block_addressable else 0
     if block_addressable and not manual_cols and int(manual_shard_count or 0) > 1:
