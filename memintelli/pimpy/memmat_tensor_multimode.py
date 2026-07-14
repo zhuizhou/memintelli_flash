@@ -125,6 +125,7 @@ class DPETensorMultiMode(object):
         triton_mode1_gidx_direct_final=True,
         triton_mode1_input_tile_group=1,
         triton_mode1_chunked_direct_final=True,
+        mode1_require_fastpath=False,
         triton_mode2_diff_direct_final=True,
         triton_mode2_diff_gidx_from_slices=False,
         triton_mode2_diff_activation_slices=False,
@@ -318,6 +319,8 @@ class DPETensorMultiMode(object):
                 on output chunks for very wide layers. The shape-aware plan
                 keeps regular MLP layers whole and chunks lm_head-like layers
                 that would otherwise fall back to grouped GEMM.
+            mode1_require_fastpath (bool): Raise instead of silently falling
+                back when neither Mode-1 direct-final path succeeds.
             direct_output_chunk_write (bool): Write finalized 2-D output
                 chunks into the final output buffer directly instead of keeping
                 all chunks and concatenating them at the end.
@@ -476,6 +479,7 @@ class DPETensorMultiMode(object):
         self.triton_mode1_gidx_direct_final = bool(triton_mode1_gidx_direct_final)
         self.triton_mode1_input_tile_group = max(1, int(triton_mode1_input_tile_group))
         self.triton_mode1_chunked_direct_final = bool(triton_mode1_chunked_direct_final)
+        self.mode1_require_fastpath = bool(mode1_require_fastpath)
         self.triton_mode2_diff_direct_final = bool(triton_mode2_diff_direct_final)
         self.triton_mode2_diff_gidx_from_slices = bool(triton_mode2_diff_gidx_from_slices)
         self.triton_mode2_diff_activation_slices = bool(triton_mode2_diff_activation_slices)
@@ -5090,6 +5094,11 @@ class DPETensorMultiMode(object):
             if has_batch:
                 return direct_mode1.reshape(batch_shape[0], batch_shape[1], out_features)
             return direct_mode1
+
+        if bool(getattr(self, "mode1_require_fastpath", False)):
+            raise RuntimeError(
+                "Mode1 fast path was required but no Triton direct-final path succeeded."
+            )
 
         V_in = self.vread * torch.round(x_2d / x_max * (self.rdac - 1)) / (self.rdac - 1)
         if self.vnoise > 0:
