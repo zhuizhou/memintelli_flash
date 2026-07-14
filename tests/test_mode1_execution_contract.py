@@ -59,6 +59,81 @@ def test_mode1_require_fastpath_is_an_explicit_engine_option():
     assert engine.mode1_require_fastpath is True
 
 
+def test_mode1_precomputed_voltage_matches_pair_kernel_order():
+    engine = _engine(torch.device("cpu"), backend="torch", require_fastpath=False)
+    x = torch.tensor(
+        [[-1.0, -0.37, 0.0, 0.41, 0.93]],
+        dtype=torch.float32,
+    )
+    x_max = x.abs().max().clamp_min(torch.finfo(torch.float32).tiny)
+
+    actual = engine._prepare_mode1_signed_voltage(x, x_max)
+    expected = (
+        torch.round(x / x_max * (engine.rdac - 1))
+        * (engine.vread / (engine.rdac - 1))
+    ).to(engine.compute_dtype)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_mode1_precomputed_voltage_counter_is_registered():
+    engine = _engine(torch.device("cpu"), backend="torch", require_fastpath=False)
+    counters = engine.get_fastpath_counters()
+
+    assert "mode1_precomputed_v_success_count" in counters
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mode1_precomputed_voltage_preserves_pair_direct_output():
+    from memintelli.pimpy.triton_fast_accumulate import triton_mode1_gidx_direct_final
+
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    x = torch.randn((128, 512), device=device, dtype=torch.bfloat16)
+    weight = torch.randn((512, 1536), device=device, dtype=torch.bfloat16)
+    engine = _engine(device, backend="triton_gidx", require_fastpath=False)
+    x_sliced = _sliced(engine, x, is_weight=False)
+    weight_sliced = _sliced(engine, weight, is_weight=True)
+    x_2d = x_sliced.quantized_data
+    x_max = x_2d.abs().max().clamp_min(torch.finfo(x_2d.dtype).tiny)
+    gp_idx, gn_idx = weight_sliced.G_indices
+    scale = weight_sliced.mode1_w_max.float()
+    voltage = engine._prepare_mode1_signed_voltage(x_2d, x_max)
+    kwargs = dict(
+        x_max=x_max,
+        lgs=engine.LGS,
+        q_g=engine.Q_G,
+        read_sigma=0.0,
+        adc_ref_unit=(engine.HGS - engine.LGS) * engine.vread,
+        rdac=engine.rdac,
+        radc=engine.radc,
+        vread=engine.vread,
+        g_level=engine.g_level,
+        tile_in=64,
+        tile_out=64,
+        input_precision="ieee",
+        dot_dtype_override=2,
+        block_r=64,
+        block_l=16,
+        block_k=64,
+        input_tile_group=1,
+    )
+
+    inline = triton_mode1_gidx_direct_final(
+        x_2d, gp_idx, gn_idx, scale, **kwargs
+    )
+    precomputed = triton_mode1_gidx_direct_final(
+        x_2d,
+        gp_idx,
+        gn_idx,
+        scale,
+        precomputed_v=voltage,
+        **kwargs,
+    )
+
+    torch.testing.assert_close(precomputed, inline, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mode1_direct_final_hits_without_fallback():
     device = torch.device("cuda")

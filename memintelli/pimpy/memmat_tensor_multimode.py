@@ -726,6 +726,8 @@ class DPETensorMultiMode(object):
             "mode1_gidx_direct_final_success_count": 0,
             "mode1_gidx_direct_final_fallback_count": 0,
             "mode1_gidx_direct_final_grouped_success_count": 0,
+            "mode1_precomputed_v_success_count": 0,
+            "mode1_precomputed_v_fallback_count": 0,
             "mode1_chunked_direct_final_attempt_count": 0,
             "mode1_chunked_direct_final_success_count": 0,
             "mode1_chunked_direct_final_fallback_count": 0,
@@ -1624,6 +1626,28 @@ class DPETensorMultiMode(object):
         if torch.is_tensor(adc_ref):
             adc_ref = adc_ref.to(device=current_f.device, dtype=self.adc_compute_dtype)
         return torch.round(current_f / adc_ref * (radc_val - 1)) / (radc_val - 1)
+
+    def _prepare_mode1_signed_voltage(self, x_2d, x_max):
+        if x_2d.is_cuda:
+            from .triton_fast_accumulate import triton_mode1_precompute_signed_voltage
+
+            return triton_mode1_precompute_signed_voltage(
+                x_2d,
+                x_max=x_max,
+                rdac=int(self.rdac),
+                vread=float(self.vread),
+                dtype=self.compute_dtype,
+            )
+        x_f = x_2d.to(torch.float32)
+        x_max_f = x_max.to(device=x_f.device, dtype=torch.float32)
+        safe_xmax = x_max_f.clamp_min(torch.finfo(torch.float32).tiny)
+        voltage = (
+            torch.round(x_f / safe_xmax * (self.rdac - 1))
+            * (self.vread / (self.rdac - 1))
+        )
+        if self.vnoise > 0:
+            voltage = voltage * (1.0 + torch.randn_like(voltage) * self.vnoise)
+        return voltage.to(self.compute_dtype)
 
     def _sliced_quant_qmax(self, sd: SlicedDataMultiMode):
         bits = int(torch.sum(sd.slice_method).item())
@@ -4869,6 +4893,7 @@ class DPETensorMultiMode(object):
         *,
         c0=None,
         c1=None,
+        precomputed_v=None,
     ):
         if not (
             bool(getattr(self, "triton_mode1_gidx_direct_final", False))
@@ -4963,6 +4988,7 @@ class DPETensorMultiMode(object):
                 block_l=int(plan["block_l"]),
                 block_k=int(plan["block_k"]),
                 input_tile_group=int(plan["input_tile_group"]),
+                precomputed_v=precomputed_v,
             )
         except Exception as exc:
             self._fastpath_count("mode1_gidx_direct_final_fallback_count")
@@ -4998,6 +5024,7 @@ class DPETensorMultiMode(object):
         x_max,
         tile_in,
         tile_out,
+        precomputed_v=None,
     ):
         if not (
             bool(getattr(self, "triton_mode1_gidx_direct_final", False))
@@ -5028,6 +5055,7 @@ class DPETensorMultiMode(object):
                 tile_out,
                 c0=c0,
                 c1=c1,
+                precomputed_v=precomputed_v,
             )
             if chunk is None:
                 self._fastpath_count("mode1_chunked_direct_final_fallback_count")
@@ -5068,6 +5096,12 @@ class DPETensorMultiMode(object):
         scale_grid = mat.mode1_w_max.to(device=x_2d.device, dtype=torch.float32)
 
         x_max = torch.max(torch.abs(x_2d)).clamp_min(torch.finfo(x_2d.dtype).tiny)
+        try:
+            V_in = self._prepare_mode1_signed_voltage(x_2d, x_max)
+        except Exception:
+            self._fastpath_count("mode1_precomputed_v_fallback_count")
+            raise
+        self._fastpath_count("mode1_precomputed_v_success_count")
 
         direct_mode1 = self._triton_mode1_gidx_direct_final_output(
             x_2d,
@@ -5076,6 +5110,7 @@ class DPETensorMultiMode(object):
             x_max,
             tile_in,
             tile_out,
+            precomputed_v=V_in,
         )
         if direct_mode1 is not None:
             if has_batch:
@@ -5089,6 +5124,7 @@ class DPETensorMultiMode(object):
             x_max,
             tile_in,
             tile_out,
+            precomputed_v=V_in,
         )
         if direct_mode1 is not None:
             if has_batch:
@@ -5099,10 +5135,6 @@ class DPETensorMultiMode(object):
             raise RuntimeError(
                 "Mode1 fast path was required but no Triton direct-final path succeeded."
             )
-
-        V_in = self.vread * torch.round(x_2d / x_max * (self.rdac - 1)) / (self.rdac - 1)
-        if self.vnoise > 0:
-            V_in = V_in * (1.0 + torch.randn_like(V_in) * self.vnoise)
 
         chunks = list(self._iter_output_chunks(mat, x=x))
         direct_write_output = self._can_direct_write_output_chunks_2d(x, mat, chunks) and len(chunks) > 1

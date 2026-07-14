@@ -6796,6 +6796,24 @@ if triton is not None:
 
 
     @triton.jit
+    def _mode1_signed_dac_kernel(
+        x,
+        x_max,
+        out,
+        total: tl.constexpr,
+        RDAC_SCALE: tl.constexpr,
+        VOLTAGE_STEP: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < total
+        raw = tl.load(x + offs, mask=mask, other=0.0).to(tl.float32)
+        safe_xmax = tl.maximum(tl.load(x_max).to(tl.float32), 1.1754943508222875e-38)
+        voltage = _round_even(raw / safe_xmax * RDAC_SCALE) * VOLTAGE_STEP
+        tl.store(out + offs, voltage, mask=mask)
+
+
+    @triton.jit
     def _mode1_gidx_direct_final_kernel(
         x,
         gp_idx,
@@ -6832,6 +6850,7 @@ if triton is not None:
         INPUT_PRECISION: tl.constexpr,
         DOT_DTYPE: tl.constexpr,
         USE_READ_NOISE: tl.constexpr,
+        USE_PRECOMPUTED_V: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_L: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -6869,7 +6888,10 @@ if triton is not None:
                 mask=mask_r[:, None] & mask_k[None, :],
                 other=0.0,
             ).to(tl.float32)
-            v = _round_even(x_raw / safe_xmax * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+            if USE_PRECOMPUTED_V:
+                v = x_raw
+            else:
+                v = _round_even(x_raw / safe_xmax * RDAC_SCALE) * (VREAD / RDAC_SCALE)
             gp = tl.load(
                 gp_idx + k_abs[:, None] * gp_s0 + out_cols[None, :] * gp_s1,
                 mask=mask_k[:, None] & mask_l[None, :],
@@ -6953,6 +6975,7 @@ if triton is not None:
         INPUT_PRECISION: tl.constexpr,
         DOT_DTYPE: tl.constexpr,
         USE_READ_NOISE: tl.constexpr,
+        USE_PRECOMPUTED_V: tl.constexpr,
         USE_ATOMIC: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_L: tl.constexpr,
@@ -7002,7 +7025,10 @@ if triton is not None:
                     mask=mask_r[:, None] & mask_k[None, :],
                     other=0.0,
                 ).to(tl.float32)
-                v = _round_even(x_raw / safe_xmax * RDAC_SCALE) * (VREAD / RDAC_SCALE)
+                if USE_PRECOMPUTED_V:
+                    v = x_raw
+                else:
+                    v = _round_even(x_raw / safe_xmax * RDAC_SCALE) * (VREAD / RDAC_SCALE)
                 gp = tl.load(
                     gp_idx + k_abs[:, None] * gp_s0 + out_cols[None, :] * gp_s1,
                     mask=mask_k[:, None] & mask_l[None, :],
@@ -7306,6 +7332,32 @@ def triton_restore_mode2_gdiff_gidx_read_noise(
         num_warps=4,
     )
     return out
+
+
+def triton_restore_mode1_gdiff_gidx_read_noise(
+    gp_idx: torch.Tensor,
+    gn_idx: torch.Tensor,
+    *,
+    lgs: float,
+    q_g: float,
+    read_sigma: float,
+    dtype: torch.dtype,
+    noise_seed: int = 12345,
+    noise_offset_base: int = 0,
+    block: int = 256,
+) -> torch.Tensor:
+    """Restore one mode-1 noisy differential-conductance working set."""
+    return triton_restore_mode2_gdiff_gidx_read_noise(
+        gp_idx,
+        gn_idx,
+        lgs=lgs,
+        q_g=q_g,
+        read_sigma=read_sigma,
+        dtype=dtype,
+        noise_seed=noise_seed,
+        noise_offset_base=noise_offset_base,
+        block=block,
+    )
 
 
 def triton_fast_accumulate_2d(
@@ -8425,6 +8477,42 @@ def triton_diff_input_accumulate_2d_from_slices_gidx_direct_final(
     return out
 
 
+def triton_mode1_precompute_signed_voltage(
+    x: torch.Tensor,
+    *,
+    x_max: float | torch.Tensor,
+    rdac: int,
+    vread: float,
+    dtype: torch.dtype,
+    block: int = 256,
+) -> torch.Tensor:
+    if triton is None:
+        raise RuntimeError(f"Triton fast accumulate is unavailable: {TRITON_IMPORT_ERROR}")
+    if not x.is_cuda or x.dim() != 2:
+        raise ValueError("Mode-1 signed DAC precompute expects a 2-D CUDA tensor.")
+    if rdac < 2:
+        raise ValueError("rdac must be >= 2.")
+    x0 = x.contiguous()
+    if torch.is_tensor(x_max):
+        xmax = x_max.detach().to(device=x0.device, dtype=torch.float32).reshape(()).contiguous()
+    else:
+        xmax = torch.tensor(float(x_max), device=x0.device, dtype=torch.float32)
+    out = torch.empty(x0.shape, device=x0.device, dtype=dtype)
+    total = x0.numel()
+    grid = (triton.cdiv(total, int(block)),)
+    _mode1_signed_dac_kernel[grid](
+        x0,
+        xmax,
+        out,
+        total,
+        float(rdac - 1),
+        float(vread / (rdac - 1)),
+        int(block),
+        num_warps=4,
+    )
+    return out
+
+
 def triton_mode1_gidx_direct_final(
     x: torch.Tensor,
     gp_idx: torch.Tensor,
@@ -8450,6 +8538,7 @@ def triton_mode1_gidx_direct_final(
     block_l: int = 16,
     block_k: int = 64,
     input_tile_group: int = 1,
+    precomputed_v: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run mode-1 compressed differential-pair VMM directly into final output.
 
@@ -8475,7 +8564,12 @@ def triton_mode1_gidx_direct_final(
     if input_tile_group <= 0:
         raise ValueError("input_tile_group must be positive.")
 
-    x0 = x.contiguous()
+    if precomputed_v is not None:
+        if precomputed_v.shape != x.shape or precomputed_v.device != x.device:
+            raise ValueError("precomputed_v must match the mode-1 input shape and device.")
+        x0 = precomputed_v.contiguous()
+    else:
+        x0 = x.contiguous()
     gp = gp_idx.contiguous()
     gn = gn_idx.contiguous()
     ws = w_scale.contiguous()
@@ -8555,6 +8649,7 @@ def triton_mode1_gidx_direct_final(
             input_precision,
             dot_dtype,
             use_read_noise,
+            bool(precomputed_v is not None),
             bool(use_atomic),
             int(block_r),
             int(block_l),
@@ -8606,6 +8701,7 @@ def triton_mode1_gidx_direct_final(
         input_precision,
         dot_dtype,
         use_read_noise,
+        bool(precomputed_v is not None),
         int(block_r),
         int(block_l),
         int(block_k),
