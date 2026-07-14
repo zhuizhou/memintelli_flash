@@ -726,6 +726,7 @@ class DPETensorMultiMode(object):
             "mode1_gidx_direct_final_success_count": 0,
             "mode1_gidx_direct_final_fallback_count": 0,
             "mode1_gidx_direct_final_grouped_success_count": 0,
+            "mode1_gidx_strided_operand_count": 0,
             "mode1_chunked_direct_final_attempt_count": 0,
             "mode1_chunked_direct_final_success_count": 0,
             "mode1_chunked_direct_final_fallback_count": 0,
@@ -4935,6 +4936,8 @@ class DPETensorMultiMode(object):
         try:
             gp_chunk = gp_idx[:, out_start:out_end]
             gn_chunk = gn_idx[:, out_start:out_end]
+            if not gp_chunk.is_contiguous() or not gn_chunk.is_contiguous() or not scale_chunk.is_contiguous():
+                self._fastpath_count("mode1_gidx_strided_operand_count")
             noise_offset_base = 0
             if self._has_read_noise and self._rv_sigma > 0:
                 noise_offset_base = self._read_noise_restore_counter * gp_chunk.numel() * 2

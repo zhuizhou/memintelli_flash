@@ -38,6 +38,13 @@ def _resolve_dot_dtype(default_dot_dtype: int, dot_dtype_override: int | None = 
     return dot_dtype
 
 
+def _mode1_kernel_operand(tensor: torch.Tensor) -> torch.Tensor:
+    """Preserve row-strided Mode-1 chunks that the Triton kernel can address."""
+    if tensor.dim() > 0 and tensor.stride(-1) == 1 and all(stride >= 0 for stride in tensor.stride()):
+        return tensor
+    return tensor.contiguous()
+
+
 def _normalize_runtime_noise_address(noise_seed: int, noise_offset_base: int) -> tuple[int, int]:
     return int(noise_seed) & 0xFFFFFFFF, int(noise_offset_base) & 0x7FFFFFFFFFFFFFFF
 
@@ -8475,10 +8482,10 @@ def triton_mode1_gidx_direct_final(
     if input_tile_group <= 0:
         raise ValueError("input_tile_group must be positive.")
 
-    x0 = x.contiguous()
-    gp = gp_idx.contiguous()
-    gn = gn_idx.contiguous()
-    ws = w_scale.contiguous()
+    x0 = _mode1_kernel_operand(x)
+    gp = _mode1_kernel_operand(gp_idx)
+    gn = _mode1_kernel_operand(gn_idx)
+    ws = _mode1_kernel_operand(w_scale)
     if torch.is_tensor(x_max):
         xmax = x_max.detach().to(device=x0.device, dtype=torch.float32).reshape(()).contiguous()
     else:

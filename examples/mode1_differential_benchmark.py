@@ -3,11 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from memintelli.pimpy.data_formats_multimode import SlicedDataMultiMode
 from memintelli.pimpy.memmat_tensor_multimode import DPETensorMultiMode
