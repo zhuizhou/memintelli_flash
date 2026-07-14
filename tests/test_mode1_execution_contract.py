@@ -142,6 +142,38 @@ def test_mode1_gdiff_workspace_uses_geometric_capacity_and_reuses_it():
     assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
 
 
+def test_mode1_gdiff_auto_dispatch_uses_measured_shape_rule():
+    engine = _engine(
+        torch.device("cpu"),
+        backend="torch",
+        require_fastpath=False,
+        gdiff_direct=True,
+    )
+
+    qkv = engine._mode1_gdiff_launch_plan(128, 4096, 4096, 64, 64)
+    down = engine._mode1_gdiff_launch_plan(128, 12288, 4096, 64, 64)
+    lm_head = engine._mode1_gdiff_launch_plan(128, 4096, 248320, 64, 64)
+
+    assert (qkv["block_r"], qkv["block_l"], qkv["schedule"], qkv["input_tile_group"]) == (
+        64,
+        32,
+        "owner",
+        64,
+    )
+    assert (down["block_r"], down["block_l"], down["schedule"], down["input_tile_group"]) == (
+        64,
+        32,
+        "grouped",
+        4,
+    )
+    assert (lm_head["block_r"], lm_head["block_l"], lm_head["schedule"], lm_head["input_tile_group"]) == (
+        64,
+        32,
+        "owner",
+        64,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mode1_precomputed_voltage_preserves_pair_direct_output():
     from memintelli.pimpy.triton_fast_accumulate import triton_mode1_gidx_direct_final

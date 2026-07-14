@@ -5043,6 +5043,40 @@ class DPETensorMultiMode(object):
         group = configured if configured > 1 else 4
         return min(input_tiles, group), "grouped"
 
+    def _mode1_gdiff_launch_plan(self, rows, in_features, out_features, tile_in, tile_out):
+        input_tiles = max(1, (int(in_features) + int(tile_in) - 1) // int(tile_in))
+        output_tiles = max(1, (int(out_features) + int(tile_out) - 1) // int(tile_out))
+        requested = str(getattr(self, "mode1_gdiff_schedule", "auto") or "auto")
+        if requested != "auto":
+            input_tile_group, schedule = self._mode1_gdiff_input_tile_group(in_features, tile_in)
+            return {
+                "block_r": max(1, int(self.triton_block_r)),
+                "block_l": max(1, int(self.triton_block_l)),
+                "block_k": max(1, int(self.triton_block_k)),
+                "input_tile_group": input_tile_group,
+                "schedule": schedule,
+                "shape_key": f"manual_{schedule}",
+            }
+
+        if input_tiles <= 64:
+            schedule = "owner"
+            input_tile_group = input_tiles
+        else:
+            schedule = "grouped"
+            input_tile_group = min(input_tiles, 4)
+        block_l = 32
+        return {
+            "block_r": 64,
+            "block_l": block_l,
+            "block_k": 64,
+            "input_tile_group": input_tile_group,
+            "schedule": schedule,
+            "shape_key": (
+                f"auto_r{int(rows)}_it{input_tiles}_ot{output_tiles}_"
+                f"br64_bl{block_l}_{schedule}{input_tile_group}"
+            ),
+        }
+
     def _mode1_gdiff_execution_window_cols(self, mat, tile_out, out_features):
         requested = int(getattr(mat, "mode1_execution_window_cols", 0) or 0)
         if requested <= 0:
@@ -5126,17 +5160,15 @@ class DPETensorMultiMode(object):
             if scale_chunk.numel() == 0:
                 return None
 
-        plan = self._mode1_triton_plan(
-            x_2d,
-            mat,
+        launch_plan = self._mode1_gdiff_launch_plan(
+            x_2d.shape[0],
+            x_2d.shape[1],
+            out_end - out_start,
             tile_in,
             tile_out,
-            out_cols=int(out_end - out_start),
         )
-        input_tile_group, schedule = self._mode1_gdiff_input_tile_group(
-            x_2d.shape[1],
-            tile_in,
-        )
+        input_tile_group = int(launch_plan["input_tile_group"])
+        schedule = str(launch_plan["schedule"])
         try:
             from .triton_fast_accumulate import (
                 triton_mode1_gdiff_direct_final,
@@ -5212,9 +5244,9 @@ class DPETensorMultiMode(object):
                 tile_out=int(tile_out),
                 input_precision=self.triton_input_precision,
                 dot_dtype_override=self._triton_dot_dtype_override(),
-                block_r=int(plan["block_r"]),
-                block_l=int(plan["block_l"]),
-                block_k=int(plan["block_k"]),
+                block_r=int(launch_plan["block_r"]),
+                block_l=int(launch_plan["block_l"]),
+                block_k=int(launch_plan["block_k"]),
                 input_tile_group=int(input_tile_group),
             )
         except Exception as exc:
@@ -5242,7 +5274,7 @@ class DPETensorMultiMode(object):
             shape_key=(
                 f"rows={int(x_2d.shape[0])};in={int(x_2d.shape[1])};"
                 f"out={int(out_end - out_start)};tile={int(tile_in)}x{int(tile_out)};"
-                f"schedule={schedule};group={int(input_tile_group)};{plan['shape_key']}"
+                f"schedule={schedule};group={int(input_tile_group)};{launch_plan['shape_key']}"
             ),
         )
         return out
