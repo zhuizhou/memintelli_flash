@@ -8,7 +8,7 @@
 
 - 主要优化对象是 `mode1`。该模式不展开input slice或weight slice；每个量化权重映射为一对 `G+`/`G-`，signed DAC输入驱动差分电导，差分电流在ADC前形成，ADC按input tile执行。
 - `mode2` 只做兼容性回归，不作为本轮优化重点或主要性能结果。
-- 不把论文实验数据、S1 planner、motivation/evaluation脚本、Nsight结果或临时诊断代码发布到 `v2.1`。
+- 发布完整DAC投稿运行时，包括mode0正式使用的状态调度模块；不发布论文实验数据、motivation/evaluation脚本、Nsight结果或临时诊断代码。
 
 ## 执行设计
 
@@ -59,7 +59,7 @@
 ## 发布设计
 
 1. 从 GitHub `v2.1` 创建独立干净工作区。
-2. 以 DAC 投稿版本的运行时源码为准，白名单同步 package、必要测试、一个差分对benchmark和简洁使用文档。
+2. 以 DAC 投稿版本的完整 `memintelli/` package为准，另外白名单同步必要测试、一个差分对benchmark和简洁使用文档。
 3. 不复制研究目录、结果JSON、论文图表、服务器脚本和缓存。
 4. 在发布树执行语法检查、CPU测试、GPU正确性和端到端benchmark。
 5. 审计 `git status`、`git diff --stat`、大文件和敏感信息。
