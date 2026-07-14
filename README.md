@@ -128,6 +128,42 @@ This branch also includes a multimode LinearMem inference path for LLMs. See
 [`examples/13_llama_inference.py`](./examples/13_llama_inference.py) for
 Llama-3.1-8B WikiText-2 inference with `mode=0`, `mode=1`, and `mode=2`.
 
+### Memintelli-Flash v2.2
+
+v2.2 adds the optimized mode0 bit-serial path and a new mode1 differential-pair
+speed path. Both use the same S1 state-budget interface. Mode1 additionally
+precomputes signed DAC voltage, restores independent noisy `G+` and `G-` into a
+reusable differential-conductance workspace, and executes one BF16 VMM per
+input tile with FP32 ADC and final accumulation.
+
+Mode0 speed example:
+
+```bash
+python examples/20_real_llm_prefill_benchmark.py \
+  --model-path /path/to/qwen-model \
+  --no-include-hf --include-v3-mode0 --no-include-v3-mode1 \
+  --execution-mode speed --s1-stage budgeted --s2-stage full \
+  --dtype bfloat16 --compute-dtype bfloat16 --conductance-dtype bfloat16 \
+  --read-variation 0.05 --simulate-lm-head --require-all-linears
+```
+
+Mode1 speed example:
+
+```bash
+python examples/20_real_llm_prefill_benchmark.py \
+  --model-path /path/to/qwen-model \
+  --no-include-hf --no-include-v3-mode0 --include-v3-mode1 \
+  --execution-mode speed --s1-stage budgeted --s2-stage full \
+  --dtype bfloat16 --compute-dtype bfloat16 --conductance-dtype bfloat16 \
+  --read-variation 0.05 --simulate-lm-head --require-all-linears
+```
+
+The mode1 speed endpoint intentionally trades additional GPU memory for lower
+latency. The workspace storage is reused, but read-noise samples are regenerated
+for every forward. At zero read variation, the existing pair-index BF16 path is
+retained as the correctness reference; BF16 VMM is validated with finite output
+and cosine similarity rather than bitwise FP32 equality.
+
 ## Todo list
 - [ ] Non-DNN applications based on matrix multiplication (e.g., `signal transformation`, `scientific computing`, `similarity computation`, `combinatorial optimization`)
 - [ ] `PTQ` support. 
