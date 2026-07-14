@@ -64,6 +64,7 @@ class SlicedDataMultiMode(object):
         self.sliced_data = None
         self.quantized_data = None
         self.max_data = None
+        self.precomputed_v_sliced = None
         self.e_bias = None
         self.mode1_w_max = None
         self.activation_slice_fused = False
@@ -193,10 +194,13 @@ class SlicedDataMultiMode(object):
 
         if self.inference:
             c.sliced_data = c.quantized_data = None
+            c.precomputed_v_sliced = None
             c.quantized_data_p = c.quantized_data_n = None
         else:
             if self.sliced_data is not None:
                 c.sliced_data = self.sliced_data.transpose(-4, -5)
+            if self.precomputed_v_sliced is not None:
+                c.precomputed_v_sliced = self.precomputed_v_sliced.transpose(-4, -5)
             if self.quantized_data is not None:
                 c.quantized_data = self.quantized_data.T
             if self.sliced_data_p is not None:
@@ -348,7 +352,8 @@ class SlicedDataMultiMode(object):
             )
 
         self.sliced_data = sd
-        self.max_data = md
+        self.max_data = md.to(torch.float32) if self.mode == 0 and md is not None else md
+        self.precomputed_v_sliced = None
         self.e_bias = eb
 
         if qd is not None:
@@ -379,6 +384,14 @@ class SlicedDataMultiMode(object):
             and mat.is_cuda
             and mat.dtype in (torch.bfloat16, torch.float32)
             and bool(getattr(self, "enable_triton_activation_slicing", False))
+            and (
+                not bool(getattr(engine, "_mode0_requires_fp32_analog_compute", lambda: False)())
+                or bool(getattr(engine, "_mode0_vmm_uses_low_precision_override", lambda: False)())
+                or bool(getattr(engine, "_mode0_fast_policy_requested", lambda: False)())
+            )
+            and not bool(
+                getattr(engine, "_mode0_seeded_semantic_audit", lambda: False)()
+            )
             and ndr == 1
             and ndc == 1
             and int(ps[0]) == 1
@@ -388,7 +401,10 @@ class SlicedDataMultiMode(object):
         ):
             return False
         try:
-            from memintelli.pimpy.triton_fast_accumulate import triton_slice_mode0_2d_uniform1
+            from memintelli.pimpy.triton_fast_accumulate import (
+                triton_slice_mode0_2d_uniform1,
+                triton_slice_mode0_2d_uniform1_with_voltage,
+            )
             rows, cols = int(mat.shape[1]), int(mat.shape[2])
             tile_cols = int(ps[1])
             tile_count = math.ceil(cols / tile_cols)
@@ -408,14 +424,37 @@ class SlicedDataMultiMode(object):
             ):
                 sliced_out = self._activation_slice_buffer
                 max_data_out = self._activation_max_buffer
-            sliced, max_data = triton_slice_mode0_2d_uniform1(
-                mat.squeeze(0),
-                input_slices=len(self.slice_method),
-                tile_cols=tile_cols,
-                qmax=max(2 ** (self.total_bits - 1) - 1, 1),
-                sliced_out=sliced_out,
-                max_data_out=max_data_out,
+            want_voltage = (
+                bool(getattr(engine, "triton_precompute_input_voltage", False))
+                and bool(getattr(engine, "triton_direct_final_output", False))
+                and bool(getattr(engine, "triton_binary_input_slice_dac", True))
+                and getattr(engine, "mode", 0) == 0
             )
+            if want_voltage:
+                sliced, max_data, precomputed_v = triton_slice_mode0_2d_uniform1_with_voltage(
+                    mat.squeeze(0),
+                    input_slices=len(self.slice_method),
+                    tile_cols=tile_cols,
+                    qmax=max(2 ** (self.total_bits - 1) - 1, 1),
+                    vread=float(getattr(engine, "vread", 0.2)),
+                    voltage_dtype=(
+                        torch.float32
+                        if bool(getattr(engine, "triton_direct_final_exact_reduce", False))
+                        else getattr(engine, "compute_dtype", torch.bfloat16)
+                    ),
+                    sliced_out=sliced_out,
+                    max_data_out=max_data_out,
+                )
+            else:
+                sliced, max_data = triton_slice_mode0_2d_uniform1(
+                    mat.squeeze(0),
+                    input_slices=len(self.slice_method),
+                    tile_cols=tile_cols,
+                    qmax=max(2 ** (self.total_bits - 1) - 1, 1),
+                    sliced_out=sliced_out,
+                    max_data_out=max_data_out,
+                )
+                precomputed_v = None
         except Exception:
             return False
         if bool(getattr(engine, "triton_reuse_activation_slice_buffer", False)):
@@ -427,7 +466,8 @@ class SlicedDataMultiMode(object):
             self._activation_slice_buffer = None
             self._activation_max_buffer = None
         self.sliced_data = sliced
-        self.max_data = max_data
+        self.max_data = max_data.to(torch.float32)
+        self.precomputed_v_sliced = precomputed_v
         self.e_bias = None
         self.quantized_data = None
         self.shape = mat.squeeze(0).shape
@@ -447,6 +487,7 @@ class SlicedDataMultiMode(object):
 
         self.quantized_data = mat.to(torch.float32).clone()
         self.sliced_data = None
+        self.precomputed_v_sliced = None
         self.max_data = None
         self.e_bias = None
 

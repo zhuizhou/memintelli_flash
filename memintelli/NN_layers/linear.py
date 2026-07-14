@@ -21,6 +21,22 @@ from memintelli.pimpy.utils import SNR
 _STREAM_ATTRS = ('G_indices', 'G', 'max_data', 'e_bias', 'mode1_w_max')
 
 
+def _input_chunk_max_positions(engine, *, in_features, total_positions):
+    input_chunk_size = getattr(engine, "inference_input_chunk_size", None)
+    if input_chunk_size is not None and int(input_chunk_size) <= 0:
+        return int(total_positions)
+    chunk_budget = (
+        int(input_chunk_size)
+        if input_chunk_size is not None
+        else int(getattr(engine, "inference_chunk_size", None) or 32 * 1024 * 1024)
+    )
+    expansion_factor = 8
+    return min(
+        int(total_positions),
+        max(1, chunk_budget // max(1, int(in_features) * expansion_factor)),
+    )
+
+
 def _make_sliced_data(engine, slice_method, *, device, bw_e, is_weight, paral_size, quant_gran, inference=False):
     mode = getattr(engine, "mode", 0)
     if mode in (1, 2):
@@ -113,6 +129,8 @@ class LinearMem(nn.Module):
     _window_pin_cache_budget_bytes = 0
     _window_pin_cache_used_bytes = 0
     _window_pin_cache_generation = 0
+    _execution_trace_active = False
+    _execution_trace = []
 
     @classmethod
     def configure_window_pin_cache(cls, budget_bytes=0):
@@ -131,9 +149,22 @@ class LinearMem(nn.Module):
             cls._transfer_streams[key] = torch.cuda.Stream(device=device)
         return cls._transfer_streams[key]
 
+    @classmethod
+    def begin_execution_trace(cls):
+        cls._execution_trace = []
+        cls._execution_trace_active = True
+
+    @classmethod
+    def end_execution_trace(cls):
+        cls._execution_trace_active = False
+        trace = list(getattr(cls, "_execution_trace", []) or [])
+        cls._execution_trace = []
+        return trace
+
     def __init__(self, engine, in_features: int, out_features: int, input_slice:[list, tuple], weight_slice:[list, tuple],
                  bias: bool = True, device=None, dtype=torch.float32, bw_e=None, input_paral_size=(1, 32), weight_paral_size=(32, 32), 
-                 input_quant_gran=(1, 32), weight_quant_gran=(32, 32), skip_initial_mapping=False):
+                 input_quant_gran=(1, 32), weight_quant_gran=(32, 32), skip_initial_mapping=False,
+                 triton_output_chunk_limit_override=0):
         '''
         :param in_features: the input neuron number
         :param out_features: the output neuron number
@@ -170,6 +201,9 @@ class LinearMem(nn.Module):
             paral_size=weight_paral_size,
             quant_gran=weight_quant_gran,
         )
+        self.weight_sliced.triton_output_chunk_limit_override = max(
+            0, int(triton_output_chunk_limit_override or 0)
+        )
         self.engine = engine
         if not skip_initial_mapping:
             self.weight_sliced.slice_data_imp(engine, self.weight.detach().t())
@@ -183,6 +217,7 @@ class LinearMem(nn.Module):
         # and PyTorch's __setattr__ would auto-register it as a child, creating circular
         # module trees that cause RecursionError in .to() / state_dict() etc.
         object.__setattr__(self, '_next_streaming_layer', None)  # prefetch chain link
+        object.__setattr__(self, '_next_restore_prefetch_layer', None)
         object.__setattr__(self, '_prefetch_event', None)  # CUDA event for prefetch sync
         object.__setattr__(self, '_prefetch_start_event', None)
         object.__setattr__(self, '_pinned_buffers', {})  # persistent CPU source buffers
@@ -211,6 +246,10 @@ class LinearMem(nn.Module):
             'prefetch_oom_count': 0,
             'prefetch_complete_on_arrival_count': 0,
             'prefetch_pending_on_arrival_count': 0,
+            'next_restore_prefetch_started_count': 0,
+            'next_restore_prefetch_skip_count': 0,
+            'next_restore_prefetch_skip_streaming_count': 0,
+            'next_restore_prefetch_skip_unprepared_count': 0,
             'release_gpu_tensor_count': 0,
             'release_gpu_tensor_bytes': 0,
             'pinned_buffer_peak_bytes': 0,
@@ -361,6 +400,7 @@ class LinearMem(nn.Module):
             + len(getattr(self, '_window_cached_buffers', {}) or {})
         )
         counters['has_prefetch_link'] = self._next_streaming_layer is not None
+        counters['has_next_restore_prefetch_link'] = self._next_restore_prefetch_layer is not None
         counters['has_pending_prefetch_event'] = self._prefetch_event is not None
         counters['lazy_prepared'] = bool(self._lazy_prepared)
         counters['streaming'] = bool(self._streaming)
@@ -380,6 +420,8 @@ class LinearMem(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if bool(getattr(type(self), "_execution_trace_active", False)):
+            type(self)._execution_trace.append(self)
         token = (
             self.engine._profile_start("linearmem_forward_total")
             if hasattr(self.engine, "_profile_start")
@@ -460,12 +502,19 @@ class LinearMem(nn.Module):
             if bool(getattr(self.engine, 'triton_fuse_activation_slices', False)):
                 setattr(self._input_sliced_cache, 'enable_triton_activation_slicing', True)
         input_sliced = self._input_sliced_cache
+        # Mode-0 2-D Linear kernels operate on the flattened token matrix.
+        # Keep the SlicedData logical shape aligned with input_2d so direct-final
+        # paths can consume the standard [N, M, I, J, K] tiled layout.
+        if getattr(self.engine, "mode", 0) == 0:
+            input_sliced.shape = input_2d.shape
 
         # Input-dimension chunking to bound peak memory during slice_data_imp().
         # This complements engine-side matmul chunking (which chunks along weight cols).
-        chunk_budget = getattr(self.engine, 'inference_chunk_size', None) or 32 * 1024 * 1024
-        expansion_factor = 8  # conservative estimate for slicing intermediates
-        max_positions = max(1, chunk_budget // max(1, in_features * expansion_factor))
+        max_positions = _input_chunk_max_positions(
+            self.engine,
+            in_features=in_features,
+            total_positions=input_2d.shape[0],
+        )
         if getattr(self.engine, "mode", 0) == 1:
             # Mode 1 uses a per-forward signed-DAC activation scale. Splitting
             # rows would change that scale and therefore change the simulated ADC.
@@ -475,6 +524,7 @@ class LinearMem(nn.Module):
         if max_positions >= total_positions:
             if hasattr(self.engine, "schedule_mode0_restore_input_prefetch"):
                 self.engine.schedule_mode0_restore_input_prefetch(input_2d, self.weight_sliced)
+            self._schedule_next_restore_prefetch(input_2d)
             token_slice = self._runtime_stage_start()
             try:
                 if hasattr(self.engine, "probe_activation_slice_reuse"):
@@ -499,6 +549,7 @@ class LinearMem(nn.Module):
                 if cache_entry is not None:
                     input_sliced.sliced_data = cache_entry["sliced_data"]
                     input_sliced.max_data = cache_entry["max_data"]
+                    input_sliced.precomputed_v_sliced = cache_entry.get("precomputed_v_sliced")
                     input_sliced.e_bias = cache_entry.get("e_bias")
                     input_sliced.quantized_data = None
                     input_sliced.shape = input_2d.shape
@@ -525,6 +576,7 @@ class LinearMem(nn.Module):
             # Free input data immediately (keep the cache object structure)
             input_sliced.sliced_data = None
             input_sliced.max_data = None
+            input_sliced.precomputed_v_sliced = None
             input_sliced.e_bias = None
         else:
             out_chunks = []
@@ -555,6 +607,7 @@ class LinearMem(nn.Module):
                     if cache_entry is not None:
                         input_sliced.sliced_data = cache_entry["sliced_data"]
                         input_sliced.max_data = cache_entry["max_data"]
+                        input_sliced.precomputed_v_sliced = cache_entry.get("precomputed_v_sliced")
                         input_sliced.e_bias = cache_entry.get("e_bias")
                         input_sliced.quantized_data = None
                         input_sliced.shape = x_chunk.shape
@@ -580,6 +633,7 @@ class LinearMem(nn.Module):
                     self._runtime_stage_stop(token_mapreduce, 'mapreduce_count', 'mapreduce_ms')
                 input_sliced.sliced_data = None
                 input_sliced.max_data = None
+                input_sliced.precomputed_v_sliced = None
                 input_sliced.e_bias = None
             output = torch.cat(out_chunks, dim=0)
             del out_chunks
@@ -599,9 +653,13 @@ class LinearMem(nn.Module):
         if output.device != input.device:
             output = output.to(input.device)
         
-        # CRITICAL: Cast output back to input dtype (e.g., float32 → bfloat16).
-        if output.dtype != input.dtype:
-            output = output.to(input.dtype)
+        output_dtype_policy = getattr(self.engine, "linear_output_dtype", "input")
+        if output_dtype_policy in ("auto", "input", "keep"):
+            output_dtype = input.dtype
+        else:
+            output_dtype = output_dtype_policy
+        if output.dtype != output_dtype:
+            output = output.to(output_dtype)
         
         if self.bias is not None:
             output = output + self.bias
@@ -613,6 +671,35 @@ class LinearMem(nn.Module):
             finally:
                 self._runtime_stage_stop(token_release, 'release_prepared_count', 'release_prepared_ms')
         return output
+
+    def _schedule_next_restore_prefetch(self, input_2d):
+        engine = getattr(self, "engine", None)
+        if not bool(getattr(engine, "triton_cross_linear_restore_prefetch", False)):
+            return
+        next_layer = getattr(self, "_next_restore_prefetch_layer", None)
+        if next_layer is None or next_layer is self:
+            self._runtime_count('next_restore_prefetch_skip_count')
+            return
+        if bool(getattr(next_layer, "_streaming", False)):
+            self._runtime_count('next_restore_prefetch_skip_streaming_count')
+            return
+        if bool(getattr(next_layer, "_lazy_prepare", False)) and not bool(getattr(next_layer, "_lazy_prepared", False)):
+            self._runtime_count('next_restore_prefetch_skip_unprepared_count')
+            return
+        if not bool(getattr(next_layer, "inference_mode", False)):
+            self._runtime_count('next_restore_prefetch_skip_unprepared_count')
+            return
+        if getattr(next_layer, "engine", None) is not engine:
+            self._runtime_count('next_restore_prefetch_skip_count')
+            return
+        mat = getattr(next_layer, "weight_sliced", None)
+        if mat is None or not hasattr(engine, "schedule_mode0_restore_input_prefetch"):
+            self._runtime_count('next_restore_prefetch_skip_count')
+            return
+        if engine.schedule_mode0_restore_input_prefetch(input_2d, mat, prefetch_source="next_linear"):
+            self._runtime_count('next_restore_prefetch_started_count')
+        else:
+            self._runtime_count('next_restore_prefetch_skip_count')
 
     def _record_activation_slice_path(self, input_sliced):
         if bool(getattr(self.engine, 'triton_fuse_activation_slices', False)):
@@ -636,6 +723,7 @@ class LinearMem(nn.Module):
         object.__setattr__(self, '_lazy_release_after_forward', bool(release_after_forward))
         object.__setattr__(self, '_streaming_pin_policy', str(pin_policy))
         object.__setattr__(self, '_next_streaming_layer', None)
+        object.__setattr__(self, '_next_restore_prefetch_layer', None)
         return self
 
     def _prepare_inference_weight(self, streaming=False, free_weights=False, pin_policy=None):

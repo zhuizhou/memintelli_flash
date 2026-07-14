@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, List, Dict, Any, Optional
 from torch.hub import load_state_dict_from_url
-from memintelli.NN_layers import Conv2dMem, LinearMem
+from memintelli.NN_layers import Conv2dMem, LinearMem, tensor_bytes
 
 # Pretrained model URLs
 model_urls = {
@@ -336,8 +336,7 @@ class MobileNetV2(nn.Module):
             sz = 0
             for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
                 t = m._pinned_buffers.get(attr)
-                if t is not None:
-                    sz += t.nelement() * t.element_size()
+                sz += tensor_bytes(t)
             layer_g_sizes.append(sz)
             total_g_bytes += sz
         

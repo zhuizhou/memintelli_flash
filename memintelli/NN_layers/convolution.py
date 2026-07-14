@@ -11,8 +11,56 @@ import time
 import sys,os
 
 from memintelli.pimpy.data_formats import SlicedData
+from memintelli.pimpy.data_formats_multimode import SlicedDataMultiMode
 from memintelli.NN_layers.functions import conv1d_mem_func, conv2d_mem_func
 from memintelli.pimpy import DPETensor
+
+
+_STREAM_ATTRS = ('G_indices', 'G', 'max_data', 'e_bias', 'mode1_w_max')
+
+
+def _make_sliced_data(engine, slice_method, *, device, bw_e, is_weight, paral_size, quant_gran, inference=False):
+    mode = getattr(engine, "mode", 0)
+    if mode in (1, 2):
+        return SlicedDataMultiMode(
+            slice_method,
+            device=device,
+            bw_e=bw_e,
+            is_weight=is_weight,
+            paral_size=paral_size,
+            quant_gran=quant_gran,
+            inference=inference,
+            mode=mode,
+        )
+    return SlicedData(
+        slice_method,
+        device=device,
+        bw_e=bw_e,
+        is_weight=is_weight,
+        paral_size=paral_size,
+        quant_gran=quant_gran,
+        inference=inference,
+    )
+
+
+def _to_cpu_pinned(value):
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return tuple(_to_cpu_pinned(item) for item in value)
+    if value.device.type != 'cpu':
+        value = value.cpu()
+    if torch.cuda.is_available() and not value.is_pinned():
+        value = value.pin_memory()
+    return value
+
+
+def _to_device(value, device):
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return tuple(_to_device(item, device) for item in value)
+    return value.to(device, non_blocking=True)
 
 class Conv1dMem(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size,  input_slice:[list, tuple], weight_slice:[list, tuple],
@@ -84,8 +132,15 @@ class Conv2dMem(nn.Module):
 
         self.input_paral_size = input_paral_size
         self.input_quant_gran = input_quant_gran
-        self.weight_sliced = SlicedData(self.weight_slice_method, device=device,
-                                        bw_e=bw_e, is_weight=True, paral_size=weight_paral_size, quant_gran=weight_quant_gran)
+        self.weight_sliced = _make_sliced_data(
+            engine,
+            self.weight_slice_method,
+            device=device,
+            bw_e=bw_e,
+            is_weight=True,
+            paral_size=weight_paral_size,
+            quant_gran=weight_quant_gran,
+        )
         self.engine = engine
         if not skip_initial_mapping:
             # the sliced weight shape is (C_in*kh*kw, C_out)
@@ -116,8 +171,15 @@ class Conv2dMem(nn.Module):
         # input_unfold size: (N, C*kh*kw, L), N is the batch size, C is the channel, kh and kw is the kernel size
         # L is the length of the unfolded vector, L = H_out * W_out
         # transpose the input_unfold to (N, L, C*kh*kw)
-        input_sliced = SlicedData(self.input_slice_method, device=input.device, bw_e=self.weight_sliced.bw_e,
-        is_weight=False, paral_size=self.input_paral_size, quant_gran=self.input_quant_gran)
+        input_sliced = _make_sliced_data(
+            self.engine,
+            self.input_slice_method,
+            device=input.device,
+            bw_e=self.weight_sliced.bw_e,
+            is_weight=False,
+            paral_size=self.input_paral_size,
+            quant_gran=self.input_quant_gran,
+        )
         input_unfold = F.unfold(input, kernel_size=self.weight.shape[2:], stride=self.stride, padding=self.padding,
                                 dilation=self.dilation).transpose(1, 2)
         input_sliced.slice_data_imp(self.engine, input_unfold.detach())
@@ -154,8 +216,10 @@ class Conv2dMem(nn.Module):
 
         # Reuse cached SlicedData object
         if self._input_sliced_cache is None:
-            self._input_sliced_cache = SlicedData(
-                self.input_slice_method, device=input.device,
+            self._input_sliced_cache = _make_sliced_data(
+                self.engine,
+                self.input_slice_method,
+                device=input.device,
                 bw_e=self.weight_sliced.bw_e, is_weight=False,
                 paral_size=self.input_paral_size,
                 quant_gran=self.input_quant_gran,
@@ -241,15 +305,10 @@ class Conv2dMem(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.synchronize()  # ensure G computation is complete
         
-        for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
+        for attr in _STREAM_ATTRS:
             tensor = getattr(ws, attr, None)
             if tensor is not None:
-                if tensor.device.type != 'cpu':
-                    cpu_t = tensor.cpu()
-                else:
-                    cpu_t = tensor
-                if not cpu_t.is_pinned():
-                    cpu_t = cpu_t.pin_memory()
+                cpu_t = _to_cpu_pinned(tensor)
                 self._pinned_buffers[attr] = cpu_t
                 setattr(ws, attr, cpu_t)
 
@@ -260,10 +319,10 @@ class Conv2dMem(nn.Module):
         Subsequent layers should use _async_prefetch for overlap.
         """
         ws = self.weight_sliced
-        for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
+        for attr in _STREAM_ATTRS:
             pinned = self._pinned_buffers.get(attr)
             if pinned is not None:
-                setattr(ws, attr, pinned.to(device, non_blocking=True))
+                setattr(ws, attr, _to_device(pinned, device))
         torch.cuda.synchronize(device)
 
     def _async_prefetch(self, device):
@@ -276,10 +335,10 @@ class Conv2dMem(nn.Module):
             stream = Conv2dMem._get_transfer_stream(device)
             ws = self.weight_sliced
             with torch.cuda.stream(stream):
-                for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
+                for attr in _STREAM_ATTRS:
                     pinned = self._pinned_buffers.get(attr)
                     if pinned is not None:
-                        setattr(ws, attr, pinned.to(device, non_blocking=True))
+                        setattr(ws, attr, _to_device(pinned, device))
             object.__setattr__(self, '_prefetch_event', stream.record_event())
         except torch.cuda.OutOfMemoryError:
             # Prefetch failed — reset to pinned CPU, next forward will sync-load
@@ -298,7 +357,7 @@ class Conv2dMem(nn.Module):
         approach (which did GPU→CPU copy + re-pin on every forward pass).
         """
         ws = self.weight_sliced
-        for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
+        for attr in _STREAM_ATTRS:
             pinned = self._pinned_buffers.get(attr)
             if pinned is not None:
                 setattr(ws, attr, pinned)

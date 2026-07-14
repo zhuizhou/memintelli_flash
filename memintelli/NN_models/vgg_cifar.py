@@ -203,7 +203,8 @@ def vgg_cifar_zoo(
         "input_paral_size": input_paral_size,
         "weight_paral_size": weight_paral_size,
         "input_quant_gran": input_quant_gran,
-        "weight_quant_gran": weight_quant_gran
+        "weight_quant_gran": weight_quant_gran,
+        "skip_initial_mapping": pretrained,
     } if mem_enabled else {}
     
     model = VGG_CIFAR(

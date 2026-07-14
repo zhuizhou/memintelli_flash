@@ -9,6 +9,53 @@ try:
 except ImportError:
     from data_formats_multimode import SlicedDataMultiMode
 
+
+_INDEX_CAST_INT32_LIMIT = torch.iinfo(torch.int32).max
+
+
+def _compressed_index_cast_needs_segmentation(tensor):
+    if tensor.numel() == 0:
+        return False
+    max_relative_offset = sum(
+        max(0, int(size) - 1) * abs(int(stride))
+        for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return max_relative_offset > _INDEX_CAST_INT32_LIMIT
+
+
+def _cast_compressed_index_chunk(tensor, dtype):
+    if not _compressed_index_cast_needs_segmentation(tensor):
+        return tensor.to(dtype)
+
+    if tensor.is_cuda and tensor.dim() == 5:
+        from .triton_fast_accumulate import triton_restore_gidx_read_noise
+
+        return triton_restore_gidx_read_noise(
+            tensor,
+            lgs=0.0,
+            q_g=1.0,
+            read_sigma=0.0,
+            dtype=dtype,
+            strided=True,
+            m_slab=True,
+        )
+
+    contributions = [
+        max(0, int(size) - 1) * abs(int(stride))
+        for size, stride in zip(tensor.shape, tensor.stride())
+    ]
+    split_dim = max(range(tensor.dim()), key=contributions.__getitem__)
+    if contributions[split_dim] == 0:
+        return tensor.to(dtype)
+
+    output = torch.empty(tensor.shape, device=tensor.device, dtype=dtype)
+    for index in range(int(tensor.shape[split_dim])):
+        output.select(split_dim, index).copy_(
+            _cast_compressed_index_chunk(tensor.select(split_dim, index), dtype)
+        )
+    return output
+
+
 class DPETensorMultiMode(object):
     """Memory-efficient multi-mode dot product engine."""
 
@@ -28,6 +75,7 @@ class DPETensorMultiMode(object):
         mode1_paral_size=(64, 64),
         mode1_adc_per_tile=True,
         inference_chunk_size=None,
+        inference_input_chunk_size=None,
         fast_inference=False,
         fast_inference_backend="torch",
         triton_input_precision="ieee",
@@ -39,30 +87,41 @@ class DPETensorMultiMode(object):
         triton_mode0_input_tile_group=1,
         triton_gidx_read_noise=False,
         triton_gidx_fused_restore_read_noise=True,
-        triton_gidx_restore_block=1024,
+        triton_gidx_restore_block=512,
         triton_gidx_restore_block_auto=True,
         triton_gidx_restore_small_block=128,
         triton_gidx_restore_auto_in_features_threshold=4096,
         triton_gidx_restore_num_warps=4,
         triton_gidx_restore_strided=True,
         triton_gidx_restore_m_slab=True,
+        triton_gidx_restore_approx_linear_noise=False,
+        triton_gidx_restore_exp2_noise=True,
+        triton_gidx_restore_fast_noise=False,
         triton_overlap_restore_direct=False,
+        triton_cross_linear_restore_prefetch=False,
         triton_gidx_fuse_input_slices=False,
+        triton_mode0_strict_intermediate=False,
+        triton_mode0_strict_intermediate_backend="auto",
         triton_reuse_input_voltage=False,
         triton_reuse_weight_tile=False,
         triton_precompute_input_voltage=False,
+        triton_fast_adc_scale=False,
         triton_fuse_restored_input_slices=False,
         triton_fuse_activation_slices=True,
         triton_reuse_activation_slice_buffer=False,
         triton_probe_activation_slice_reuse=False,
+        triton_probe_activation_density=False,
         triton_activation_slice_cache=False,
         triton_activation_slice_cache_max_entries=8,
         triton_binary_input_slice_dac=True,
         triton_direct_final_num_warps=4,
+        triton_direct_final_partial_m_group=0,
+        triton_direct_final_exact_reduce=False,
         triton_fuse_output_finalize=False,
         triton_direct_final_output=True,
         triton_direct_output_zero_once=False,
         triton_gidx_direct_final_output=True,
+        triton_gidx_direct_final_deterministic=False,
         triton_mode1_gidx_direct_final=True,
         triton_mode1_input_tile_group=1,
         triton_mode1_chunked_direct_final=True,
@@ -79,6 +138,9 @@ class DPETensorMultiMode(object):
         write_variation_mode="materialized",
         conductance_dtype=torch.float32,
         compute_dtype=torch.float32,
+        linear_output_dtype="input",
+        mode0_semantic_policy="auto",
+        mode0_vmm_compute_dtype="auto",
         profile=False,
         profile_sync_cuda=True,
         runtime_stage_timing=False,
@@ -111,6 +173,8 @@ class DPETensorMultiMode(object):
             mode1_adc_per_tile (bool): If True, quantize Mode 1 current per input tile; otherwise quantize after accumulation
                 only when the full input dimension fits in one Mode 1 tile.
             inference_chunk_size (int or None): Optional number of output tile columns processed per inference chunk.
+            inference_input_chunk_size (int or None): Optional activation-slicing element budget. Zero disables
+                token/row chunking. None preserves the legacy coupling to inference_chunk_size.
             fast_inference (bool): If True, fuse all weight slices for each input slice in the inference path
                 when a scalar ADC is used. This reduces small-kernel launch overhead at the cost of a larger
                 per-chunk intermediate tensor.
@@ -155,17 +219,43 @@ class DPETensorMultiMode(object):
             triton_gidx_restore_m_slab (bool): Use a faster strided restore
                 address calculation when output chunks are contiguous in p/s/k/l
                 and only gapped across the m dimension.
+            triton_gidx_restore_approx_linear_noise (bool): Approximate
+                exp(noise * sigma) as 1 + noise * sigma in the compressed-G
+                restore kernel. This is a speed/accuracy knob and changes the
+                read-variation model slightly.
+            triton_gidx_restore_fast_noise (bool): Use a lightweight
+                counter/hash normal approximation instead of Triton's full
+                random-normal generator in the compressed-G restore kernel.
+                This is an explicit approximate read-variation mode.
             triton_overlap_restore_direct (bool): Experimental mode-0 path
                 that restores the next output chunk's noisy conductance on a
                 side CUDA stream while direct-final consumes the current chunk.
+            triton_cross_linear_restore_prefetch (bool): Experimental mode-0
+                path that restores the next LinearMem layer's first noisy
+                conductance chunk on a side CUDA stream while the current layer
+                runs.
             triton_gidx_fuse_input_slices (bool): Try the experimental mode-0 kernel
                 that fuses all input slices while preserving per-slice ADC.
+            triton_mode0_strict_intermediate (bool): Route legal mode-0 2-D
+                Linear inference through the compressed G-index input-slice
+                fused kernel. The kernel stages noisy conductance inside each
+                tile, preserves per-input-slice/per-weight-slice ADC, writes
+                the strict 5-D intermediate, and leaves final reduction to the
+                normal strict path.
+            triton_mode0_strict_intermediate_backend (str): Backend selector
+                for the strict-intermediate path. "auto" and "gidx" currently
+                both use the generic compressed G-index noisy-conductance
+                tiled VMM/ADC kernel; "off" disables the route.
             triton_reuse_input_voltage (bool): In fused input-slice G-index kernels,
                 quantize each input-voltage tile once and reuse it across weight
                 slices. Per-slice ADC and read variation are still applied.
             triton_precompute_input_voltage (bool): Precompute a compact input-
                 voltage tensor for uniform 1-bit mode-0 inputs before restored
                 direct-final kernels. Experimental and disabled by default.
+            triton_fast_adc_scale (bool): Use an algebraically equivalent ADC
+                scaling order in the mode-0 precomputed-voltage direct-final
+                kernel. This is a narrow arithmetic optimization and does not
+                change slice or ADC semantics.
             triton_fuse_restored_input_slices (bool): Try the experimental mode-0
                 kernel that fuses input slices after conductance has already been
                 restored, including the read-variation restored path.
@@ -195,6 +285,18 @@ class DPETensorMultiMode(object):
                 restored-conductance 2-D kernel that writes the finalized
                 [tokens, output_features] chunk directly, avoiding the 5-D
                 MapReduce intermediate.
+            triton_direct_final_partial_m_group (int): Experimental deterministic
+                mode-0 direct-final path for precomputed-voltage kernels. Values
+                >0 write fixed-order per-M partial buffers and reduce them in a
+                second kernel instead of atomically accumulating all input tiles
+                into the final output.
+            triton_direct_final_exact_reduce (bool): Use deterministic mode-0
+                direct-final finalization when supported. This keeps the
+                per-slice VMM/ADC direct-final dataflow, but replaces the
+                final-output atomic accumulation over input tiles with a fixed
+                M-order reduce. For restored-conductance kernels this currently
+                routes uniform 1-bit input slices through the precomputed-V
+                partial-M path.
             triton_direct_output_zero_once (bool): For mode-0 direct-output
                 chunk writes, initialize the full final output buffer once and
                 skip per-chunk zero-fill before atomic accumulation. This is a
@@ -203,6 +305,11 @@ class DPETensorMultiMode(object):
             triton_gidx_direct_final_output (bool): When direct-final-output
                 is enabled, try the compressed G-index direct-final kernel
                 before restoring conductance tensors.
+            triton_gidx_direct_final_deterministic (bool): Experimental
+                mode-0 G-index direct-final kernel that reduces input tiles in
+                fixed M order and stores the final output instead of atomically
+                accumulating per-M programs. Currently intended for read_var=0
+                semantic probes.
             triton_mode1_input_tile_group (int): Number of Mode-1 input tiles
                 reduced inside one direct-final Triton program before writing
                 the output. Values >1 reduce final-output atomic writes when
@@ -220,6 +327,21 @@ class DPETensorMultiMode(object):
                 "virtual" stores level indices and regenerates deterministic write variation per chunk.
             conductance_dtype (torch.dtype or str): dtype used for stored materialized conductance tensors.
             compute_dtype (torch.dtype or str): dtype used for restored conductance and input-voltage tensors.
+            linear_output_dtype (str or torch.dtype): LinearMem output dtype policy.
+                "input" restores the previous module-compatible behavior.
+                "auto" currently aliases "input". Explicit float dtypes force
+                the returned Linear output dtype and are useful for diagnostics
+                such as FP32-state + low-precision V/G dot runs.
+            mode0_semantic_policy (str): "auto" uses the normal mode-0 Triton
+                execution path regardless of whether the read-noise stream is
+                seeded. "strict" explicitly selects the torch-order diagnostic
+                audit path. "fast" is retained as an explicit speed-policy
+                alias for older experiment manifests.
+            mode0_vmm_compute_dtype (str or torch.dtype): Mode-0 voltage and
+                conductance operand dtype for VMM/einsum. "auto" follows
+                compute_dtype even when analog variation is enabled; ADC,
+                noise generation, and reduction stay controlled separately.
+                Pass float32 explicitly for a full-FP32 VMM control run.
             profile (bool): Collect synchronized timing events for the inference path.
             profile_sync_cuda (bool): Synchronize CUDA before/after profiled regions for accurate timings.
             runtime_stage_timing (bool): Collect per-LinearMem runtime stage timings. Keep disabled for
@@ -233,9 +355,22 @@ class DPETensorMultiMode(object):
         if write_variation_mode not in ("materialized", "virtual"):
             raise ValueError("write_variation_mode must be 'materialized' or 'virtual'.")
         self.write_variation_mode = write_variation_mode
-        self.conductance_dtype = self._resolve_float_dtype(conductance_dtype, "conductance_dtype")
-        self.compute_dtype = self._resolve_float_dtype(compute_dtype, "compute_dtype")
         self.mode = mode
+        self.conductance_dtype = self._resolve_float_dtype(conductance_dtype, "conductance_dtype")
+        self.requested_compute_dtype = self._resolve_float_dtype(compute_dtype, "compute_dtype")
+        self.compute_dtype = self._effective_compute_dtype(mode, self.requested_compute_dtype)
+        self.adc_compute_dtype = torch.float32
+        self.linear_output_dtype = self._resolve_linear_output_dtype(linear_output_dtype)
+        if mode0_semantic_policy not in ("auto", "strict", "fast"):
+            raise ValueError("mode0_semantic_policy must be 'auto', 'strict', or 'fast'.")
+        self.mode0_semantic_policy = mode0_semantic_policy
+        if isinstance(mode0_vmm_compute_dtype, str) and mode0_vmm_compute_dtype.replace("torch.", "").lower() == "auto":
+            self.mode0_vmm_compute_dtype = "auto"
+        else:
+            self.mode0_vmm_compute_dtype = self._resolve_float_dtype(
+                mode0_vmm_compute_dtype,
+                "mode0_vmm_compute_dtype",
+            )
         if mode2_input_mode not in ("signed", "differential"):
             raise ValueError("mode2_input_mode must be 'signed' or 'differential'.")
         self.mode2_input_mode = mode2_input_mode
@@ -274,6 +409,7 @@ class DPETensorMultiMode(object):
         self.mode1_adc_per_tile = mode1_adc_per_tile
         self.mode1_paral_size = mode1_paral_size
         self.inference_chunk_size = inference_chunk_size
+        self.inference_input_chunk_size = inference_input_chunk_size
         self.fast_inference = fast_inference
         if fast_inference_backend not in ("torch", "triton", "triton_gidx"):
             raise ValueError("fast_inference_backend must be 'torch', 'triton', or 'triton_gidx'.")
@@ -298,23 +434,45 @@ class DPETensorMultiMode(object):
         self.triton_gidx_restore_num_warps = max(1, int(triton_gidx_restore_num_warps))
         self.triton_gidx_restore_strided = bool(triton_gidx_restore_strided)
         self.triton_gidx_restore_m_slab = bool(triton_gidx_restore_m_slab)
+        self.triton_gidx_restore_approx_linear_noise = bool(triton_gidx_restore_approx_linear_noise)
+        self.triton_gidx_restore_exp2_noise = bool(triton_gidx_restore_exp2_noise)
+        self.triton_gidx_restore_fast_noise = bool(triton_gidx_restore_fast_noise)
         self.triton_overlap_restore_direct = bool(triton_overlap_restore_direct)
+        self.triton_cross_linear_restore_prefetch = bool(triton_cross_linear_restore_prefetch)
+        if triton_mode0_strict_intermediate_backend not in ("auto", "gidx", "off"):
+            raise ValueError("triton_mode0_strict_intermediate_backend must be 'auto', 'gidx', or 'off'.")
+        self.triton_mode0_strict_intermediate = bool(triton_mode0_strict_intermediate)
+        self.triton_mode0_strict_intermediate_backend = triton_mode0_strict_intermediate_backend
         self.triton_gidx_fuse_input_slices = bool(triton_gidx_fuse_input_slices)
+        if self.triton_mode0_strict_intermediate and self.triton_mode0_strict_intermediate_backend != "off":
+            self.triton_gidx_fuse_input_slices = True
+            self.triton_gidx_read_noise = True
         self.triton_reuse_input_voltage = bool(triton_reuse_input_voltage)
         self.triton_reuse_weight_tile = bool(triton_reuse_weight_tile)
         self.triton_precompute_input_voltage = bool(triton_precompute_input_voltage)
+        self.triton_fast_adc_scale = bool(triton_fast_adc_scale)
         self.triton_fuse_restored_input_slices = bool(triton_fuse_restored_input_slices)
         self.triton_fuse_activation_slices = bool(triton_fuse_activation_slices)
         self.triton_reuse_activation_slice_buffer = bool(triton_reuse_activation_slice_buffer)
         self.triton_probe_activation_slice_reuse = bool(triton_probe_activation_slice_reuse)
+        self.triton_probe_activation_density = bool(triton_probe_activation_density)
         self.triton_activation_slice_cache = bool(triton_activation_slice_cache)
         self.triton_activation_slice_cache_max_entries = max(1, int(triton_activation_slice_cache_max_entries))
         self.triton_binary_input_slice_dac = bool(triton_binary_input_slice_dac)
         self.triton_direct_final_num_warps = max(1, int(triton_direct_final_num_warps))
+        self.triton_direct_final_partial_m_group = max(0, int(triton_direct_final_partial_m_group))
+        self.triton_direct_final_exact_reduce = bool(triton_direct_final_exact_reduce)
         self.triton_fuse_output_finalize = bool(triton_fuse_output_finalize)
         self.triton_direct_final_output = bool(triton_direct_final_output)
         self.triton_direct_output_zero_once = bool(triton_direct_output_zero_once)
         self.triton_gidx_direct_final_output = bool(triton_gidx_direct_final_output)
+        self.triton_gidx_direct_final_deterministic = bool(triton_gidx_direct_final_deterministic)
+        if self.triton_mode0_strict_intermediate and self.triton_mode0_strict_intermediate_backend != "off" and self.mode == 0:
+            self.triton_direct_final_output = False
+            self.triton_gidx_direct_final_output = False
+            self.triton_overlap_restore_direct = False
+            self.triton_precompute_input_voltage = False
+            self.triton_fast_adc_scale = False
         self.triton_mode1_gidx_direct_final = bool(triton_mode1_gidx_direct_final)
         self.triton_mode1_input_tile_group = max(1, int(triton_mode1_input_tile_group))
         self.triton_mode1_chunked_direct_final = bool(triton_mode1_chunked_direct_final)
@@ -342,6 +500,7 @@ class DPETensorMultiMode(object):
         self._triton_auto_counter_seen = set()
         self._read_noise_restore_counter = 0
         self._read_noise_forward_offset_counter = 0
+        self._read_noise_generators = {}
         self._mode0_restore_prefetch = {}
         self.device = device
 
@@ -418,6 +577,77 @@ class DPETensorMultiMode(object):
             raise ValueError(f"{name} must be float32, float16, or bfloat16.")
         return dtype
 
+    @staticmethod
+    def _resolve_linear_output_dtype(dtype):
+        if isinstance(dtype, str):
+            key = dtype.replace("torch.", "").lower()
+            if key in ("auto", "input", "keep"):
+                return key
+            return DPETensorMultiMode._resolve_float_dtype(key, "linear_output_dtype")
+        return DPETensorMultiMode._resolve_float_dtype(dtype, "linear_output_dtype")
+
+    @staticmethod
+    def _effective_compute_dtype(mode, requested_dtype):
+        """Honor the requested V/G compute dtype; sensitive ADC/reduction stays FP32 separately."""
+        return requested_dtype
+
+    def _triton_dot_dtype_override(self):
+        if self.compute_dtype is torch.bfloat16:
+            return 2
+        if self.compute_dtype is torch.float16:
+            return 1
+        return 0
+
+    def _mode0_requires_fp32_analog_compute(self) -> bool:
+        return (
+            self.mode == 0
+            and (
+                self._has_read_noise
+                or self.vnoise > 0
+                or self.write_variation > 0
+                or self._has_drift
+                or self.rate_stuck_HGS > 0
+                or self.rate_stuck_LGS > 0
+            )
+        )
+
+    def _mode0_strict_semantic_path(self) -> bool:
+        if self.mode != 0:
+            return False
+        policy = getattr(self, "mode0_semantic_policy", "auto")
+        return policy == "strict"
+
+    def _mode0_seeded_semantic_audit(self) -> bool:
+        return self._mode0_strict_semantic_path()
+
+    def _mode0_fast_policy_requested(self) -> bool:
+        return getattr(self, "mode0_semantic_policy", "auto") == "fast"
+
+    def _mode0_analog_compute_dtype(self):
+        override = getattr(self, "mode0_vmm_compute_dtype", "auto")
+        if override != "auto":
+            return override
+        return self.compute_dtype
+
+    def _mode0_restore_compute_dtype(self):
+        return self._mode0_analog_compute_dtype()
+
+    def _read_noise_compute_dtype(self):
+        return torch.float32
+
+    def _mode0_dot_dtype_override(self):
+        override = getattr(self, "mode0_vmm_compute_dtype", "auto")
+        if override == "auto":
+            return self._triton_dot_dtype_override()
+        if override is torch.bfloat16:
+            return 2
+        if override is torch.float16:
+            return 1
+        return 0
+
+    def _mode0_vmm_uses_low_precision_override(self) -> bool:
+        return self._mode0_analog_compute_dtype() in (torch.float16, torch.bfloat16)
+
     def _write_variation_is_virtual(self):
         return self.write_variation > 0 and self.write_variation_mode == "virtual"
 
@@ -438,6 +668,11 @@ class DPETensorMultiMode(object):
             "gidx_read_noise_input_slice_fused_attempt_count": 0,
             "gidx_read_noise_input_slice_fused_success_count": 0,
             "gidx_read_noise_input_slice_fused_fallback_count": 0,
+            "mode0_strict_intermediate_attempt_count": 0,
+            "mode0_strict_intermediate_success_count": 0,
+            "mode0_strict_intermediate_fallback_count": 0,
+            "mode0_strict_intermediate_read_noise_success_count": 0,
+            "mode0_strict_intermediate_clean_success_count": 0,
             "restored_input_slice_fused_attempt_count": 0,
             "restored_input_slice_fused_success_count": 0,
             "restored_input_slice_fused_fallback_count": 0,
@@ -450,7 +685,9 @@ class DPETensorMultiMode(object):
             "direct_final_output_store_success_count": 0,
             "direct_final_binary_input_slice_success_count": 0,
             "direct_final_output_precomputed_v_success_count": 0,
+            "direct_final_output_partial_m_success_count": 0,
             "precompute_input_voltage_count": 0,
+            "precompute_input_voltage_fused_slice_count": 0,
             "direct_output_zero_once_count": 0,
             "gidx_direct_final_output_attempt_count": 0,
             "gidx_direct_final_output_success_count": 0,
@@ -497,6 +734,15 @@ class DPETensorMultiMode(object):
             "overlap_restore_input_discard_count": 0,
             "overlap_restore_input_skip_large_count": 0,
             "overlap_restore_input_skip_seeded_count": 0,
+            "overlap_restore_input_skip_memory_count": 0,
+            "overlap_restore_existing_prefetch_count": 0,
+            "overlap_restore_next_prefetch_count": 0,
+            "overlap_restore_next_hit_count": 0,
+            "overlap_restore_next_miss_count": 0,
+            "overlap_restore_next_discard_count": 0,
+            "overlap_restore_next_skip_large_count": 0,
+            "overlap_restore_next_skip_memory_count": 0,
+            "overlap_restore_direct_skip_memory_count": 0,
             "gidx_restore_block_auto_count": 0,
             "gidx_restore_block_auto_small_count": 0,
             "gidx_restore_block_auto_base_count": 0,
@@ -509,9 +755,25 @@ class DPETensorMultiMode(object):
             "activation_slice_cache_store_count": 0,
             "activation_slice_cache_evict_count": 0,
             "activation_slice_cache_bytes": 0,
+            "activation_density_probe_count": 0,
+            "activation_density_probe_elements": 0,
+            "activation_density_probe_nonzero": 0,
+            "activation_density_probe_zero_tiles": 0,
+            "activation_density_probe_tiles": 0,
+            "activation_density_probe_zero_rows": 0,
+            "activation_density_probe_rows": 0,
+            "activation_density_probe_zero_row_blocks_br32": 0,
+            "activation_density_probe_row_blocks_br32": 0,
+            "activation_density_probe_zero_row_blocks_br64": 0,
+            "activation_density_probe_row_blocks_br64": 0,
+            "activation_density_probe_zero_direct_row_blocks_br32": 0,
+            "activation_density_probe_direct_row_blocks_br32": 0,
+            "activation_density_probe_zero_direct_row_blocks_br64": 0,
+            "activation_density_probe_direct_row_blocks_br64": 0,
         }
         self._read_noise_restore_counter = 0
         self._read_noise_forward_offset_counter = 0
+        self._read_noise_generators = {}
         self._mode0_restore_prefetch = {}
         self._triton_auto_counter_seen = set()
         self._activation_slice_reuse_probe = {}
@@ -576,12 +838,20 @@ class DPETensorMultiMode(object):
             self._activation_slice_cache = cache
         sliced = input_sliced.sliced_data.detach()
         max_data = input_sliced.max_data.detach()
+        precomputed_v = (
+            None
+            if getattr(input_sliced, "precomputed_v_sliced", None) is None
+            else input_sliced.precomputed_v_sliced.detach()
+        )
         bytes_used = sliced.nelement() * sliced.element_size() + max_data.nelement() * max_data.element_size()
+        if precomputed_v is not None:
+            bytes_used += precomputed_v.nelement() * precomputed_v.element_size()
         entry = {
             "key": key,
             "anchor": data,
             "sliced_data": sliced,
             "max_data": max_data,
+            "precomputed_v_sliced": precomputed_v,
             "e_bias": None if input_sliced.e_bias is None else input_sliced.e_bias.detach(),
             "activation_slice_fused": bool(getattr(input_sliced, "activation_slice_fused", False)),
             "bytes": int(bytes_used),
@@ -639,6 +909,73 @@ class DPETensorMultiMode(object):
                 else:
                     self._fastpath_count("activation_slice_reuse_probe_gap_gt8_count")
 
+    def probe_activation_density(self, input_sliced):
+        """Record activation slice density for optimization feasibility checks."""
+        if not bool(getattr(self, "triton_probe_activation_density", False)):
+            return
+        sliced = getattr(input_sliced, "sliced_data", None)
+        if sliced is None or not getattr(sliced, "is_cuda", False):
+            return
+        self._fastpath_count("activation_density_probe_count")
+        try:
+            nz = torch.count_nonzero(sliced).item()
+            total = sliced.numel()
+            self._fastpath_count("activation_density_probe_nonzero", int(nz))
+            self._fastpath_count("activation_density_probe_elements", int(total))
+            # Shape is [N, M, I, J, K] for mode-0 activation slices. A tile is
+            # skippable only if one whole [J, K] tile for an input slice is zero.
+            if sliced.dim() == 5:
+                tile_sum = torch.count_nonzero(sliced, dim=(-1, -2))
+                zero_tiles = torch.count_nonzero(tile_sum == 0).item()
+                self._fastpath_count("activation_density_probe_zero_tiles", int(zero_tiles))
+                self._fastpath_count("activation_density_probe_tiles", int(tile_sum.numel()))
+                row_sum = torch.count_nonzero(sliced, dim=-1)
+                zero_rows = torch.count_nonzero(row_sum == 0).item()
+                self._fastpath_count("activation_density_probe_zero_rows", int(zero_rows))
+                self._fastpath_count("activation_density_probe_rows", int(row_sum.numel()))
+                rows = int(sliced.shape[-2])
+                for block_r in (32, 64):
+                    zero_blocks = 0
+                    total_blocks = 0
+                    for r0 in range(0, rows, block_r):
+                        block = sliced[..., r0 : min(r0 + block_r, rows), :]
+                        block_sum = torch.count_nonzero(block, dim=(-1, -2))
+                        zero_blocks += int(torch.count_nonzero(block_sum == 0).item())
+                        total_blocks += int(block_sum.numel())
+                    self._fastpath_count(
+                        f"activation_density_probe_zero_row_blocks_br{block_r}",
+                        int(zero_blocks),
+                    )
+                    self._fastpath_count(
+                        f"activation_density_probe_row_blocks_br{block_r}",
+                        int(total_blocks),
+                    )
+                direct_rows = int(sliced.shape[0]) * int(sliced.shape[3])
+                row_view = (
+                    sliced.permute(0, 3, 1, 2, 4)
+                    .contiguous()
+                    .reshape(direct_rows, int(sliced.shape[1]), int(sliced.shape[2]), int(sliced.shape[4]))
+                )
+                for block_r in (32, 64):
+                    zero_blocks = 0
+                    total_blocks = 0
+                    for r0 in range(0, direct_rows, block_r):
+                        block = row_view[r0 : min(r0 + block_r, direct_rows), :, :, :]
+                        block_count = torch.count_nonzero(block, dim=0)
+                        block_sum = torch.count_nonzero(block_count, dim=-1)
+                        zero_blocks += int(torch.count_nonzero(block_sum == 0).item())
+                        total_blocks += int(block_sum.numel())
+                    self._fastpath_count(
+                        f"activation_density_probe_zero_direct_row_blocks_br{block_r}",
+                        int(zero_blocks),
+                    )
+                    self._fastpath_count(
+                        f"activation_density_probe_direct_row_blocks_br{block_r}",
+                        int(total_blocks),
+                    )
+        except Exception:
+            return
+
     def get_fastpath_counters(self):
         if not getattr(self, "fastpath_counters", None):
             self.reset_fastpath_counters()
@@ -652,7 +989,7 @@ class DPETensorMultiMode(object):
         self.fastpath_counters[key] = self.fastpath_counters.get(key, 0) + value
 
     def _select_triton_gidx_restore_block(self, idx_chunk):
-        base_block = max(1, int(getattr(self, "triton_gidx_restore_block", 1024)))
+        base_block = max(1, int(getattr(self, "triton_gidx_restore_block", 512)))
         if not bool(getattr(self, "triton_gidx_restore_block_auto", False)):
             self._fastpath_count(f"gidx_restore_block_{base_block}_count")
             return base_block
@@ -805,7 +1142,6 @@ class DPETensorMultiMode(object):
             input_tile_group = max(1, int(getattr(self, "triton_mode0_input_tile_group", 1)))
         else:
             input_tile_group = max(1, int(getattr(self, "triton_mode1_input_tile_group", 1)))
-
         if int(mode) == 0:
             slice_work = max(1, input_slices * weight_slices)
             block_r = 64 if rows >= 1 else max(1, int(self.triton_block_r))
@@ -818,8 +1154,17 @@ class DPETensorMultiMode(object):
                 block_l = 8
             else:
                 block_l = max(1, tile_cols)
-            if slice_work >= 48 and tile_cols >= 16:
-                block_l = 16
+            if (
+                4 <= slice_work <= 64
+                and rows == 128
+                and (
+                    (in_tiles == 64 and out_tiles in (192, 194, 384))
+                    or (in_tiles == 192 and out_tiles == 64)
+                )
+                and tile_cols >= 64
+            ):
+                block_r = 16 if slice_work == 9 else 32
+                block_l = 64
 
             block_k = 64 if tile_k >= 64 else max(16, tile_k)
             chunk_limit = min(out_tiles, chunk_limit)
@@ -832,7 +1177,7 @@ class DPETensorMultiMode(object):
             # group>1 and chunk512 can regress on Qwen-style MLP/lm_head layers,
             # so the auto plan keeps those guards while still specializing
             # block/chunk metadata per shape.
-            block_r = 32 if rows >= 32 else 16
+            block_r = 64 if rows >= 64 else 32 if rows >= 32 else 16
             block_l = 16 if tile_cols >= 16 else max(1, tile_cols)
             block_k = 64 if tile_k >= 64 else max(16, tile_k)
             chunk_limit = min(out_tiles, chunk_limit, 192)
@@ -844,8 +1189,8 @@ class DPETensorMultiMode(object):
             block_k = 64 if block_k > 64 else 32 if block_k > 32 else 16
         if block_r not in (16, 32, 64, 128):
             block_r = 64 if block_r > 64 else 32 if block_r > 32 else 16
-        if block_l not in (1, 2, 4, 8, 16, 32):
-            block_l = 16 if block_l > 16 else 8 if block_l > 8 else 4
+        if block_l not in (1, 2, 4, 8, 16, 32, 64):
+            block_l = 64 if block_l > 64 else 32 if block_l > 32 else 16 if block_l > 16 else 8 if block_l > 8 else 4
 
         plan = {
             "block_r": int(block_r),
@@ -869,6 +1214,29 @@ class DPETensorMultiMode(object):
             x=x, mat=mat, g=g, gidx=gidx, vin=vin
         )
         return block_r, block_l, block_k, block_shape_key
+
+    def _mode0_should_reuse_input_voltage(self, shape) -> bool:
+        """Return whether the precomputed-V reuse loop is worthwhile for this mode-0 shape."""
+        if not bool(getattr(self, "triton_reuse_input_voltage", False)):
+            return False
+        rows = self._shape_int(shape.get("rows"))
+        tile_cols = self._shape_int(shape.get("tile_cols"), self.triton_block_l)
+        tile_k = self._shape_int(shape.get("tile_k"), self.triton_block_k)
+        input_slices = self._shape_int(shape.get("input_slices"))
+        weight_slices = self._shape_int(shape.get("weight_slices"))
+        in_tiles = self._shape_int(shape.get("in_tiles"))
+        out_tiles = self._shape_int(shape.get("out_tiles"))
+        slice_work = input_slices * weight_slices
+        return (
+            slice_work == 25
+            and rows == 128
+            and tile_cols >= 64
+            and tile_k >= 64
+            and (
+                (in_tiles == 64 and out_tiles in (64, 194))
+                or (in_tiles == 192 and out_tiles == 64)
+            )
+        )
 
     def _mode0_manual_shape_key(self, shape, block_r, block_l, block_k, input_tile_group):
         return (
@@ -913,6 +1281,9 @@ class DPETensorMultiMode(object):
         return block_r, block_l, block_k, plan["shape_key"], input_tile_group
 
     def _mode0_triton_chunk_limit(self, ndc_y, mat=None, x=None):
+        per_weight_limit = int(getattr(mat, "triton_output_chunk_limit_override", 0) or 0)
+        if per_weight_limit > 0:
+            return min(max(1, int(ndc_y)), per_weight_limit)
         limit = max(1, int(getattr(self, "triton_output_chunk_limit", 256)))
         if not (self.triton_auto_config and self.mode == 0):
             return limit
@@ -1245,7 +1616,10 @@ class DPETensorMultiMode(object):
             torch.Tensor: Quantized normalized current.
         """
         radc_val = int(self.radc.item()) if self.radc_is_list else int(self.radc)
-        return torch.round(current / adc_ref * (radc_val - 1)) / (radc_val - 1)
+        current_f = current.to(self.adc_compute_dtype)
+        if torch.is_tensor(adc_ref):
+            adc_ref = adc_ref.to(device=current_f.device, dtype=self.adc_compute_dtype)
+        return torch.round(current_f / adc_ref * (radc_val - 1)) / (radc_val - 1)
 
     def _sliced_quant_qmax(self, sd: SlicedDataMultiMode):
         bits = int(torch.sum(sd.slice_method).item())
@@ -1729,8 +2103,10 @@ class DPETensorMultiMode(object):
         Gp = torch.where(pos, lvl * self.Q_G + self.LGS, low)
         Gn = torch.where(~pos, torch.abs(lvl) * self.Q_G + self.LGS, low)
         Gp, Gn = self._apply_write_nonideals_pair(Gp, Gn, 42, 43, 123, 124)
-        return (torch.clamp(Gp, self.LGS, self.HGS),
-                torch.clamp(Gn, self.LGS, self.HGS))
+        return (
+            torch.clamp(Gp, self.LGS, self.HGS).to(self.conductance_dtype),
+            torch.clamp(Gn, self.LGS, self.HGS).to(self.conductance_dtype),
+        )
 
     def _num2G_mode2(self, data_p, data_n, max_weights):
         """
@@ -1816,9 +2192,30 @@ class DPETensorMultiMode(object):
             torch.Tensor: Conductance tensor after read noise.
         """
         """Lognormal read noise with O(N) memory (shared helper)."""
+        out_dtype = G.dtype
+        noise_dtype = self._read_noise_compute_dtype()
+        if G.dtype != noise_dtype:
+            G = G.to(noise_dtype)
+        generator = None
+        if self.read_variation_seed is not None:
+            generators = getattr(self, "_read_noise_generators", None)
+            if generators is None:
+                generators = {}
+                self._read_noise_generators = generators
+            key = str(G.device)
+            generator = generators.get(key)
+            if generator is None:
+                generator = torch.Generator(device=G.device)
+                generator.manual_seed(int(self._read_noise_seed_base))
+                generators[key] = generator
         if self._rv_all_same:
             if self._rv_sigma > 0:
-                noise = torch.randn_like(G)
+                noise = torch.randn(
+                    G.shape,
+                    device=G.device,
+                    dtype=noise_dtype,
+                    generator=generator,
+                )
                 noise.mul_(self._rv_sigma).exp_()
                 noise.mul_(G)
                 G = noise
@@ -1827,14 +2224,21 @@ class DPETensorMultiMode(object):
             level_idx = torch.round((G - self.LGS) / self.Q_G).long().clamp(
                 0, self.g_level - 1
             )
-            var_t = self._read_variation_tensor.to(device=G.device, dtype=G.dtype)
+            var_t = self._read_variation_tensor.to(device=G.device, dtype=noise_dtype)
             std_per_el = var_t[level_idx]
             del level_idx, var_t
-            noise = torch.randn_like(G)
+            noise = torch.randn(
+                G.shape,
+                device=G.device,
+                dtype=noise_dtype,
+                generator=generator,
+            )
             noise.mul_(std_per_el).exp_()
             del std_per_el
             noise.mul_(G)
             G = noise
+        if G.dtype != out_dtype:
+            G = G.to(out_dtype)
         return G
 
 
@@ -1862,7 +2266,7 @@ class DPETensorMultiMode(object):
         else:
             raise ValueError("Input data must be 2-D or 3-D.")
 
-        V_in = sliced_data.to(self.compute_dtype)
+        V_in = sliced_data.to(self._mode0_analog_compute_dtype())
         V_in.div_(xmax)
         V_in.mul_(self.rdac - 1)
         V_in.round_()
@@ -1900,7 +2304,7 @@ class DPETensorMultiMode(object):
         Returns:
             torch.Tensor: Quantized voltage tensor for the slice.
         """
-        Vin_i = x_slice.to(self.compute_dtype)
+        Vin_i = x_slice.to(self._mode0_analog_compute_dtype())
         Vin_i.div_(xmax_i)
         Vin_i.mul_(self.rdac - 1)
         Vin_i.round_()
@@ -1929,17 +2333,22 @@ class DPETensorMultiMode(object):
         Returns:
             torch.Tensor: Conductance values with LGS removed, optionally including read noise.
         """
-        if (
-            self._has_read_noise
-            and idx_chunk.is_cuda
+        can_use_triton_restore = (
+            idx_chunk.is_cuda
             and self._rv_all_same
-            and self._rv_sigma > 0
             and not self._write_variation_is_virtual()
             and self.triton_gidx_fused_restore_read_noise
-        ):
+            and (
+                not self._mode0_requires_fp32_analog_compute()
+                or self._mode0_vmm_uses_low_precision_override()
+                or self._mode0_fast_policy_requested()
+            )
+            and not self._mode0_seeded_semantic_audit()
+        )
+        if can_use_triton_restore and (not self._has_read_noise or self._rv_sigma > 0):
             try:
                 from .triton_fast_accumulate import triton_restore_gidx_read_noise
-                if noise_offset_base is None:
+                if self._has_read_noise and noise_offset_base is None:
                     noise_offset_base = self._read_noise_restore_counter * idx_chunk.numel()
                     self._read_noise_restore_counter += 1
                 restore_block = self._select_triton_gidx_restore_block(idx_chunk)
@@ -1947,19 +2356,25 @@ class DPETensorMultiMode(object):
                     idx_chunk,
                     lgs=self.LGS,
                     q_g=self.Q_G,
-                    read_sigma=float(self._rv_sigma),
-                    dtype=self.compute_dtype,
+                    read_sigma=float(self._rv_sigma if self._has_read_noise else 0.0),
+                    dtype=self._mode0_restore_compute_dtype(),
                     noise_seed=self._read_noise_seed_base,
-                    noise_offset_base=int(noise_offset_base),
+                    noise_offset_base=int(noise_offset_base or 0),
                     block=restore_block,
                     num_warps=int(getattr(self, "triton_gidx_restore_num_warps", 4)),
                     strided=bool(getattr(self, "triton_gidx_restore_strided", True)),
                     m_slab=bool(getattr(self, "triton_gidx_restore_m_slab", True)),
+                    approx_linear_noise=bool(getattr(self, "triton_gidx_restore_approx_linear_noise", False)),
+                    exp2_noise=bool(getattr(self, "triton_gidx_restore_exp2_noise", False)),
+                    fast_noise=bool(getattr(self, "triton_gidx_restore_fast_noise", False)),
                 )
             except Exception:
                 pass
 
-        G_chunk = idx_chunk.to(self.compute_dtype)
+        G_chunk = _cast_compressed_index_chunk(
+            idx_chunk,
+            self._mode0_restore_compute_dtype(),
+        )
         G_chunk.mul_(self.Q_G)
         if self._write_variation_is_virtual() or self._has_read_noise:
             G_chunk.add_(self.LGS)
@@ -1987,8 +2402,9 @@ class DPETensorMultiMode(object):
         Returns:
             torch.Tensor: Conductance values with LGS removed, optionally including read noise.
         """
-        if G_chunk.dtype != self.compute_dtype:
-            G_chunk = G_chunk.to(self.compute_dtype)
+        restore_dtype = self._mode0_restore_compute_dtype()
+        if G_chunk.dtype != restore_dtype:
+            G_chunk = G_chunk.to(restore_dtype)
         if self._has_read_noise:
             G_chunk = self._apply_read_noise_tensor(G_chunk)
             G_chunk.sub_(self.LGS)
@@ -2041,8 +2457,8 @@ class DPETensorMultiMode(object):
         if getattr(mat, "G_indices", None) is None or getattr(mat.G_indices, "dim", lambda: 0)() != 5:
             return None
         total = int(mat.G_indices.numel())
-        base = int(self._read_noise_forward_offset_counter) * total
-        self._read_noise_forward_offset_counter += 1
+        base = int(self._read_noise_forward_offset_counter)
+        self._read_noise_forward_offset_counter += total
         return base
 
     def _can_schedule_mode0_restore_input_prefetch(self, input_2d, mat: SlicedDataMultiMode) -> bool:
@@ -2062,7 +2478,6 @@ class DPETensorMultiMode(object):
             and self._has_read_noise
             and self._rv_all_same
             and self._rv_sigma > 0
-            and self.read_variation_seed is None
             and bool(getattr(self, "triton_gidx_fused_restore_read_noise", False))
             and not bool(getattr(self, "triton_gidx_read_noise", False))
             and not self._write_variation_is_virtual()
@@ -2085,28 +2500,91 @@ class DPETensorMultiMode(object):
         if removed:
             self._fastpath_count("overlap_restore_input_discard_count", removed)
 
-    def schedule_mode0_restore_input_prefetch(self, input_2d, mat: SlicedDataMultiMode, noise_epoch_base=None):
+    def _discard_mode0_restore_prefetch_by_source(self, source: str):
+        pending = getattr(self, "_mode0_restore_prefetch", None)
+        if not pending:
+            return 0
+        keys = []
+        for key, item in pending.items():
+            item_source = item[2] if isinstance(item, tuple) and len(item) >= 3 else "input"
+            if item_source == source:
+                keys.append(key)
+        for key in keys:
+            pending.pop(key, None)
+        if source == "next_linear" and keys:
+            self._fastpath_count("overlap_restore_next_discard_count", len(keys))
+        return len(keys)
+
+    def _can_reserve_restore_prefetch_bytes(self, restored_bytes: int, source: str = "input"):
+        if not torch.cuda.is_available() or restored_bytes <= 0:
+            return True
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        except Exception:
+            return True
+        free_bytes = int(free_bytes)
+        restored_bytes = int(restored_bytes)
+        reserve_floor = max(512 * 1024 * 1024, restored_bytes // 2)
+        allowed = free_bytes > restored_bytes + reserve_floor
+        if not allowed:
+            if source == "next_linear":
+                self._fastpath_count("overlap_restore_next_skip_memory_count")
+            elif source == "direct":
+                self._fastpath_count("overlap_restore_direct_skip_memory_count")
+            else:
+                self._fastpath_count("overlap_restore_input_skip_memory_count")
+        return allowed
+
+    def schedule_mode0_restore_input_prefetch(
+        self,
+        input_2d,
+        mat: SlicedDataMultiMode,
+        noise_epoch_base=None,
+        prefetch_source="input",
+    ):
         """Prefetch the first restored mode-0 conductance chunk while input slicing runs."""
-        if self.read_variation_seed is not None:
-            self._fastpath_count("overlap_restore_input_skip_seeded_count")
-            return False
         if not self._can_schedule_mode0_restore_input_prefetch(input_2d, mat):
             return False
         chunks = list(self._iter_output_chunks(mat, x=None))
         if not chunks:
             return False
         c0, c1 = chunks[0]
+        source = str(prefetch_source or "input")
         idx = mat.G_indices[:, c0:c1, :, :, :]
         dtype_bytes = 2 if self.compute_dtype in (torch.float16, torch.bfloat16) else 4
+        if self._mode0_requires_fp32_analog_compute():
+            dtype_bytes = 4
         restored_bytes = int(idx.numel()) * int(dtype_bytes)
-        if restored_bytes > 1024 * 1024 * 1024:
-            self._fastpath_count("overlap_restore_input_skip_large_count")
+        large_limit = 1024 * 1024 * 1024
+        if source == "next_linear":
+            large_limit = 512 * 1024 * 1024
+        if restored_bytes > large_limit:
+            if source == "next_linear":
+                self._fastpath_count("overlap_restore_next_skip_large_count")
+            else:
+                self._fastpath_count("overlap_restore_input_skip_large_count")
             return False
+        if not self._can_reserve_restore_prefetch_bytes(restored_bytes, source=source):
+            return False
+        key = self._mode0_restore_input_prefetch_key(mat, c0, c1)
+        pending = getattr(self, "_mode0_restore_prefetch", None)
+        if pending is None:
+            pending = {}
+            self._mode0_restore_prefetch = pending
+        if key in pending:
+            item = pending.get(key)
+            item_source = item[2] if isinstance(item, tuple) and len(item) >= 3 else "input"
+            if source == "input" and item_source == "next_linear":
+                pending[key] = (item[0], item[1], "input")
+                self._fastpath_count("overlap_restore_existing_prefetch_count")
+                return True
+        if source == "next_linear":
+            self._discard_mode0_restore_prefetch_by_source("next_linear")
+        else:
+            self._discard_mode0_restore_input_prefetch(mat)
         if noise_epoch_base is None:
             noise_epoch_base = self._next_mode0_read_noise_epoch_base(mat)
         object.__setattr__(mat, "_mode0_read_noise_epoch_base", noise_epoch_base)
-        self._discard_mode0_restore_input_prefetch(mat)
-        key = self._mode0_restore_input_prefetch_key(mat, c0, c1)
         stream = getattr(self, "_overlap_restore_input_stream", None)
         if stream is None:
             stream = torch.cuda.Stream(device=input_2d.device)
@@ -2123,8 +2601,11 @@ class DPETensorMultiMode(object):
             )
             event = torch.cuda.Event()
             event.record(stream)
-        self._mode0_restore_prefetch[key] = (restored, event)
-        self._fastpath_count("overlap_restore_input_prefetch_count")
+        self._mode0_restore_prefetch[key] = (restored, event, source)
+        if source == "next_linear":
+            self._fastpath_count("overlap_restore_next_prefetch_count")
+        else:
+            self._fastpath_count("overlap_restore_input_prefetch_count")
         return True
 
     def take_mode0_restore_input_prefetch(self, mat: SlicedDataMultiMode, c0: int, c1: int):
@@ -2136,14 +2617,21 @@ class DPETensorMultiMode(object):
         if item is None:
             self._fastpath_count("overlap_restore_input_miss_count")
             return None
-        restored, event = item
+        if len(item) >= 3:
+            restored, event, source = item[:3]
+        else:
+            restored, event = item
+            source = "input"
         current = torch.cuda.current_stream(self.device)
         current.wait_event(event)
         try:
             restored.record_stream(current)
         except Exception:
             pass
-        self._fastpath_count("overlap_restore_input_hit_count")
+        if source == "next_linear":
+            self._fastpath_count("overlap_restore_next_hit_count")
+        else:
+            self._fastpath_count("overlap_restore_input_hit_count")
         return restored
 
     def _get_mode2_shifted_chunk(self, mat: SlicedDataMultiMode, c0: int, c1: int):
@@ -2293,29 +2781,29 @@ class DPETensorMultiMode(object):
         chunk_ndc = ndc_y
         if self.inference_chunk_size is not None:
             chunk_ndc = max(1, min(int(self.inference_chunk_size), ndc_y))
-        if self.fast_inference_backend in ("triton", "triton_gidx"):
-            # Very wide LLM heads can make the flattened Triton pointer offsets
-            # exceed the 32-bit range when all output tile columns are launched
-            # at once. Keep compressed-index launches bounded; the surrounding
-            # code concatenates chunks back into the same logical output.
-            g_source = None
-            if self.mode in (1, 2) and isinstance(getattr(mat, "G_indices", None), tuple):
-                g_source = mat.G_indices[0]
-            elif getattr(mat, "G_indices", None) is not None:
-                g_source = mat.G_indices
-            elif self.mode == 2 and isinstance(getattr(mat, "G", None), tuple):
-                g_source = mat.G[0]
-            elif getattr(mat, "G", None) is not None:
-                g_source = mat.G
-            if g_source is not None and len(g_source.shape) == 5:
-                m_dim, _, s_dim, k_dim, l_dim = [max(1, int(v)) for v in g_source.shape]
-                per_m_tile = max(1, s_dim * k_dim * l_dim)
-                max_by_offset = max(1, 2_000_000_000 // max(1, m_dim * per_m_tile))
+        # Compressed 5-D conductance state may still use the Triton restore
+        # kernel when the surrounding semantic loop is the PyTorch baseline.
+        # Apply its address-safety cap independently of the compute backend.
+        g_source = None
+        if self.mode in (1, 2) and isinstance(getattr(mat, "G_indices", None), tuple):
+            g_source = mat.G_indices[0]
+        elif getattr(mat, "G_indices", None) is not None:
+            g_source = mat.G_indices
+        elif self.mode == 2 and isinstance(getattr(mat, "G", None), tuple):
+            g_source = mat.G[0]
+        elif getattr(mat, "G", None) is not None:
+            g_source = mat.G
+        if g_source is not None and len(g_source.shape) == 5:
+            m_dim, _, s_dim, k_dim, l_dim = [max(1, int(v)) for v in g_source.shape]
+            per_m_tile = max(1, s_dim * k_dim * l_dim)
+            max_by_offset = max(1, 2_000_000_000 // max(1, m_dim * per_m_tile))
+            chunk_ndc = max(1, min(chunk_ndc, ndc_y, max_by_offset))
+            if self.fast_inference_backend in ("triton", "triton_gidx"):
                 chunk_limit = self._mode0_triton_chunk_limit(ndc_y, mat=mat, x=x)
-                chunk_ndc = max(1, min(chunk_ndc, ndc_y, max_by_offset, chunk_limit))
-            elif self.mode == 1:
-                chunk_limit = self._mode1_triton_chunk_limit(ndc_y, mat=mat)
-                chunk_ndc = max(1, min(chunk_ndc, ndc_y, chunk_limit))
+                chunk_ndc = max(1, min(chunk_ndc, chunk_limit))
+        elif self.mode == 1 and self.fast_inference_backend in ("triton", "triton_gidx"):
+            chunk_limit = self._mode1_triton_chunk_limit(ndc_y, mat=mat)
+            chunk_ndc = max(1, min(chunk_ndc, ndc_y, chunk_limit))
         for c0 in range(0, ndc_y, chunk_ndc):
             yield c0, min(c0 + chunk_ndc, ndc_y)
 
@@ -2383,8 +2871,8 @@ class DPETensorMultiMode(object):
         if fused is not None:
             return fused
         if x.bw_e is None:
-            mat_max_chunk = mat.max_data[:, c0:c1, :, :]
-            bm = torch.einsum("nmij, mpij->nmpij", x.max_data, mat_max_chunk)
+            mat_max_chunk = mat.max_data[:, c0:c1, :, :].to(torch.float32)
+            bm = torch.einsum("nmij, mpij->nmpij", x.max_data.to(torch.float32), mat_max_chunk)
             x_qmax = self._sliced_quant_qmax(x)
             mat_qmax = self._sliced_quant_qmax(mat)
             out = (
@@ -2515,6 +3003,13 @@ class DPETensorMultiMode(object):
             self.fast_inference
             and not self.radc_is_list
             and self.mode in (0, 2)
+            and not (
+                self.mode == 0
+                and self._has_read_noise
+                and self.read_variation_seed is not None
+                and self._mode0_seeded_semantic_audit()
+                and not bool(getattr(self, "triton_direct_final_exact_reduce", False))
+            )
         )
 
     def _can_use_triton_fast_accumulate(self, vin) -> bool:
@@ -2533,6 +3028,7 @@ class DPETensorMultiMode(object):
             and vin.is_cuda
             and self.mode in (0, 2)
             and not self.radc_is_list
+            and not self._mode0_seeded_semantic_audit()
         )
 
     def _can_use_triton_gidx_accumulate(self, vin, mat) -> bool:
@@ -2552,6 +3048,7 @@ class DPETensorMultiMode(object):
             and getattr(mat, "G_is_compressed", False)
             and not self._has_read_noise
             and not self._write_variation_is_virtual()
+            and not self._mode0_seeded_semantic_audit()
         )
 
     def _can_use_triton_gidx_read_noise_accumulate(self, vin, mat) -> bool:
@@ -2567,12 +3064,18 @@ class DPETensorMultiMode(object):
             and self._rv_sigma > 0
             and self.triton_gidx_read_noise
             and not self._write_variation_is_virtual()
+            and not self._mode0_seeded_semantic_audit()
         )
 
     def _can_use_triton_gidx_input_slice_fusion(self, x, mat) -> bool:
+        strict_intermediate = bool(getattr(self, "triton_mode0_strict_intermediate", False))
         return (
             self.fast_inference_backend == "triton_gidx"
-            and self.triton_gidx_fuse_input_slices
+            and (self.triton_gidx_fuse_input_slices or strict_intermediate)
+            and (
+                not strict_intermediate
+                or getattr(self, "triton_mode0_strict_intermediate_backend", "auto") != "off"
+            )
             and self.mode == 0
             and not self.radc_is_list
             and self.rdac >= 2
@@ -2584,13 +3087,19 @@ class DPETensorMultiMode(object):
             and not self._has_read_noise
             and not self._write_variation_is_virtual()
             and self.vnoise == 0
+            and not self._mode0_seeded_semantic_audit()
         )
 
     def _can_use_triton_gidx_read_noise_input_slice_fusion(self, x, mat) -> bool:
+        strict_intermediate = bool(getattr(self, "triton_mode0_strict_intermediate", False))
         return (
             self.fast_inference_backend == "triton_gidx"
-            and self.triton_gidx_fuse_input_slices
-            and self.triton_gidx_read_noise
+            and (self.triton_gidx_fuse_input_slices or strict_intermediate)
+            and (
+                not strict_intermediate
+                or getattr(self, "triton_mode0_strict_intermediate_backend", "auto") != "off"
+            )
+            and (self.triton_gidx_read_noise or strict_intermediate)
             and self.mode == 0
             and not self.radc_is_list
             and self.rdac >= 2
@@ -2604,30 +3113,72 @@ class DPETensorMultiMode(object):
             and self._rv_sigma > 0
             and not self._write_variation_is_virtual()
             and self.vnoise == 0
+            and not self._mode0_seeded_semantic_audit()
         )
 
-    def _can_use_triton_restored_input_slice_fusion(self, x, mat) -> bool:
-        return (
-            self.fast_inference_backend in ("triton", "triton_gidx")
-            and self.triton_fuse_restored_input_slices
-            and self.mode == 0
-            and not self.radc_is_list
-            and self.rdac >= 2
-            and len(x.shape) == 2
-            and getattr(x, "sliced_data", None) is not None
-            and x.sliced_data.is_cuda
-            and self.vnoise == 0
+    def _can_use_triton_restored_input_slice_fusion(
+        self,
+        x,
+        mat,
+        *,
+        allow_seeded_exact=False,
+    ) -> bool:
+        checks = (
+            ("backend", self.fast_inference_backend in ("triton", "triton_gidx")),
+            ("enabled", bool(getattr(self, "triton_fuse_restored_input_slices", False))),
+            ("mode", self.mode == 0),
+            (
+                "dtype_guard",
+                not self._mode0_requires_fp32_analog_compute()
+                or self._mode0_vmm_uses_low_precision_override()
+                or self._mode0_fast_policy_requested()
+                or bool(getattr(self, "triton_direct_final_exact_reduce", False)),
+            ),
+            ("radc", not self.radc_is_list),
+            ("rdac", self.rdac >= 2),
+            (
+                "rank2",
+                len(x.shape) == 2
+                or (
+                    getattr(x, "sliced_data", None) is not None
+                    and getattr(x.sliced_data, "dim", lambda: 0)() == 5
+                    and getattr(x, "max_data", None) is not None
+                    and getattr(x.max_data, "dim", lambda: 0)() == 4
+                ),
+            ),
+            ("x_sliced", getattr(x, "sliced_data", None) is not None),
+            ("x_sliced_cuda", getattr(getattr(x, "sliced_data", None), "is_cuda", False)),
+            ("no_vnoise", self.vnoise == 0),
+            (
+                "seeded_semantics",
+                not self._mode0_seeded_semantic_audit()
+                or (
+                    bool(allow_seeded_exact)
+                    and bool(getattr(self, "triton_direct_final_exact_reduce", False))
+                ),
+            ),
         )
+        for name, ok in checks:
+            if not ok:
+                if bool(getattr(self, "triton_direct_final_output", False)):
+                    self._fastpath_count(f"restored_direct_final_block_{name}_count")
+                return False
+        return True
 
     def _triton_gidx_input_slice_fused_accumulate(self, x, mat, c0, c1, slice_scale, adc_ref):
         if not self._can_use_triton_gidx_input_slice_fusion(x, mat):
             return None
+        strict_intermediate = bool(getattr(self, "triton_mode0_strict_intermediate", False))
+        if strict_intermediate:
+            self._fastpath_count("mode0_strict_intermediate_attempt_count")
         self._fastpath_count("gidx_input_slice_fused_attempt_count")
         try:
             from .triton_fast_accumulate import triton_gidx_accumulate_2d_input_slices
         except Exception as exc:
             self._fastpath_count("gidx_import_fallback_count")
             self._fastpath_count("gidx_input_slice_fused_fallback_count")
+            if strict_intermediate:
+                self._fastpath_count("mode0_strict_intermediate_fallback_count")
             if self.profile:
                 self.profile_events.append({
                     "label": "triton_gidx_input_slice_fused_import",
@@ -2654,19 +3205,33 @@ class DPETensorMultiMode(object):
                 block_r=block_r,
                 block_l=block_l,
                 block_k=block_k,
+                dot_dtype_override=self._mode0_dot_dtype_override(),
             )
         except Exception as exc:
             self._fastpath_count("gidx_exception_fallback_count")
             self._fastpath_count("gidx_input_slice_fused_fallback_count")
+            if strict_intermediate:
+                self._fastpath_count("mode0_strict_intermediate_fallback_count")
             self._profile_stop(token, backend="triton_gidx_input_slice_fused", status="fallback", reason=type(exc).__name__, message=str(exc))
             return None
         self._fastpath_count("gidx_input_slice_fused_success_count")
-        self._profile_stop(token, backend="triton_gidx_input_slice_fused", status="ok", shape_key=block_shape_key)
+        if strict_intermediate:
+            self._fastpath_count("mode0_strict_intermediate_success_count")
+            self._fastpath_count("mode0_strict_intermediate_clean_success_count")
+        backend = (
+            "triton_mode0_strict_intermediate_gidx"
+            if strict_intermediate
+            else "triton_gidx_input_slice_fused"
+        )
+        self._profile_stop(token, backend=backend, status="ok", shape_key=block_shape_key)
         return out
 
     def _triton_gidx_read_noise_input_slice_fused_accumulate(self, x, mat, c0, c1, slice_scale, adc_ref):
         if not self._can_use_triton_gidx_read_noise_input_slice_fusion(x, mat):
             return None
+        strict_intermediate = bool(getattr(self, "triton_mode0_strict_intermediate", False))
+        if strict_intermediate:
+            self._fastpath_count("mode0_strict_intermediate_attempt_count")
         self._fastpath_count("gidx_read_noise_input_slice_fused_attempt_count")
         try:
             from .triton_fast_accumulate import (
@@ -2676,6 +3241,8 @@ class DPETensorMultiMode(object):
         except Exception as exc:
             self._fastpath_count("gidx_import_fallback_count")
             self._fastpath_count("gidx_read_noise_input_slice_fused_fallback_count")
+            if strict_intermediate:
+                self._fastpath_count("mode0_strict_intermediate_fallback_count")
             if self.profile:
                 self.profile_events.append({
                     "label": "triton_gidx_read_noise_input_slice_fused_import",
@@ -2713,10 +3280,13 @@ class DPETensorMultiMode(object):
                 block_r=block_r,
                 block_l=block_l,
                 block_k=block_k,
+                dot_dtype_override=self._mode0_dot_dtype_override(),
             )
         except Exception as exc:
             self._fastpath_count("gidx_exception_fallback_count")
             self._fastpath_count("gidx_read_noise_input_slice_fused_fallback_count")
+            if strict_intermediate:
+                self._fastpath_count("mode0_strict_intermediate_fallback_count")
             self._profile_stop(
                 token,
                 backend="triton_gidx_read_noise_input_slice_fused",
@@ -2726,15 +3296,27 @@ class DPETensorMultiMode(object):
             )
             return None
         self._fastpath_count("gidx_read_noise_input_slice_fused_success_count")
-        backend = (
-            "triton_gidx_read_noise_input_slice_fused_reuse_v"
-            if self.triton_reuse_input_voltage
-            else "triton_gidx_read_noise_input_slice_fused"
-        )
+        if strict_intermediate:
+            self._fastpath_count("mode0_strict_intermediate_success_count")
+            self._fastpath_count("mode0_strict_intermediate_read_noise_success_count")
+        if strict_intermediate:
+            backend = (
+                "triton_mode0_strict_intermediate_noisy_gidx_reuse_v"
+                if self.triton_reuse_input_voltage
+                else "triton_mode0_strict_intermediate_noisy_gidx"
+            )
+        else:
+            backend = (
+                "triton_gidx_read_noise_input_slice_fused_reuse_v"
+                if self.triton_reuse_input_voltage
+                else "triton_gidx_read_noise_input_slice_fused"
+            )
         self._profile_stop(token, backend=backend, status="ok", shape_key=block_shape_key)
         return out
 
     def _triton_restored_input_slice_fused_accumulate(self, x, mat, c0, c1, g_shifted, slice_scale, adc_ref):
+        if self._requires_strict_grouped_noisy_vmm():
+            return None
         if not self._can_use_triton_restored_input_slice_fusion(x, mat):
             return None
         self._fastpath_count("restored_input_slice_fused_attempt_count")
@@ -2801,9 +3383,20 @@ class DPETensorMultiMode(object):
         triton_plan=None,
         precomputed_v_sliced=None,
     ):
+        if self._requires_strict_grouped_noisy_vmm():
+            return None
         if not (
             bool(getattr(self, "triton_direct_final_output", False))
-            and self._can_use_triton_restored_input_slice_fusion(x, mat)
+            and self._can_use_triton_restored_input_slice_fusion(
+                x,
+                mat,
+                allow_seeded_exact=True,
+            )
+            and (
+                not self._mode0_requires_fp32_analog_compute()
+                or self._mode0_vmm_uses_low_precision_override()
+                or self._mode0_fast_policy_requested()
+            )
             and getattr(x, "max_data", None) is not None
             and getattr(mat, "max_data", None) is not None
             and x.max_data.is_cuda
@@ -2835,19 +3428,31 @@ class DPETensorMultiMode(object):
                 )
             else:
                 block_r, block_l, block_k, block_shape_key, input_tile_group = triton_plan
+            shape = self._mode0_triton_shape(x=x, mat=mat, g=g_shifted)
             binary_input_slices = (
                 bool(getattr(self, "triton_binary_input_slice_dac", True))
                 and bool(getattr(x, "is_uniform_1bit_slices", False))
             )
+            partial_m_group = max(0, int(getattr(self, "triton_direct_final_partial_m_group", 0)))
+            exact_reduce = bool(getattr(self, "triton_direct_final_exact_reduce", False))
+            effective_fast_adc_scale = (
+                bool(getattr(self, "triton_fast_adc_scale", False))
+                and partial_m_group <= 0
+                and not exact_reduce
+            )
             use_precomputed_v = (
-                bool(getattr(self, "triton_precompute_input_voltage", False))
+                (
+                    bool(getattr(self, "triton_precompute_input_voltage", False))
+                    or partial_m_group > 0
+                )
+                and not exact_reduce
                 and precomputed_v_sliced is not None
                 and binary_input_slices
-                and int(input_tile_group) == 1
-                and not bool(getattr(self, "triton_reuse_input_voltage", False))
-                and not bool(getattr(self, "triton_reuse_weight_tile", False))
             )
             if use_precomputed_v:
+                direct_block_l = block_l
+                if partial_m_group > 0:
+                    direct_block_l = min(int(block_l), 8)
                 out = triton_fast_accumulate_2d_input_slices_direct_final_precomputed_v(
                     precomputed_v_sliced,
                     g_shifted,
@@ -2860,8 +3465,14 @@ class DPETensorMultiMode(object):
                     mat_qmax=float(self._sliced_quant_qmax(mat)),
                     input_precision=self.triton_input_precision,
                     block_r=block_r,
-                    block_l=block_l,
+                    block_l=direct_block_l,
                     block_k=block_k,
+                    input_tile_group=input_tile_group,
+                    reuse_input_voltage=self._mode0_should_reuse_input_voltage(shape),
+                    reuse_weight_tile=bool(getattr(self, "triton_reuse_weight_tile", False)),
+                    fast_adc_scale=effective_fast_adc_scale,
+                    partial_m_group=partial_m_group,
+                    exact_reduce=exact_reduce,
                     num_warps=int(getattr(self, "triton_direct_final_num_warps", 4)),
                     out=out_buffer,
                     out_col_offset=self._direct_output_col_range_2d(mat, c0, c1)[0] if out_buffer is not None else 0,
@@ -2886,13 +3497,15 @@ class DPETensorMultiMode(object):
                     block_l=block_l,
                     block_k=block_k,
                     input_tile_group=input_tile_group,
-                    reuse_input_voltage=bool(getattr(self, "triton_reuse_input_voltage", False)),
+                    reuse_input_voltage=self._mode0_should_reuse_input_voltage(shape),
                     reuse_weight_tile=bool(getattr(self, "triton_reuse_weight_tile", False)),
                     binary_input_slices=binary_input_slices,
                     num_warps=int(getattr(self, "triton_direct_final_num_warps", 4)),
                     out=out_buffer,
                     out_col_offset=self._direct_output_col_range_2d(mat, c0, c1)[0] if out_buffer is not None else 0,
                     out_cols=int(mat.shape[1]) if out_buffer is not None else None,
+                    dot_dtype_override=self._mode0_dot_dtype_override(),
+                    exact_reduce=exact_reduce,
                 )
         except Exception as exc:
             self._fastpath_count("direct_final_output_fallback_count")
@@ -2907,7 +3520,8 @@ class DPETensorMultiMode(object):
         self._fastpath_count("direct_final_output_success_count")
         if input_tile_group > 1:
             self._fastpath_count("mode0_direct_final_input_tile_grouped_success_count")
-        if bool(getattr(self, "triton_reuse_input_voltage", False)):
+        used_reuse_input_voltage = self._mode0_should_reuse_input_voltage(shape)
+        if used_reuse_input_voltage:
             self._fastpath_count("direct_final_output_reuse_v_requested_count")
         if bool(getattr(self, "triton_reuse_weight_tile", False)):
             self._fastpath_count("direct_final_output_reuse_w_requested_count")
@@ -2915,12 +3529,20 @@ class DPETensorMultiMode(object):
             self._fastpath_count("direct_final_binary_input_slice_success_count")
         if use_precomputed_v:
             self._fastpath_count("direct_final_output_precomputed_v_success_count")
+            if int(getattr(self, "triton_direct_final_partial_m_group", 0)) > 0:
+                self._fastpath_count("direct_final_output_partial_m_success_count")
+        if bool(getattr(self, "triton_direct_final_exact_reduce", False)):
+            self._fastpath_count("direct_final_output_exact_reduce_success_count")
+        if use_precomputed_v and effective_fast_adc_scale:
+            self._fastpath_count("direct_final_output_fast_adc_scale_success_count")
         if out_buffer is not None:
             self._fastpath_count("direct_final_output_store_success_count")
         direct_backend = "triton_direct_final_output"
         if use_precomputed_v:
             direct_backend = "triton_direct_final_output_precomputed_v"
-        if bool(getattr(self, "triton_reuse_input_voltage", False)):
+        if bool(getattr(self, "triton_direct_final_exact_reduce", False)):
+            direct_backend = "triton_direct_final_output_exact_reduce"
+        if used_reuse_input_voltage:
             direct_backend = "triton_direct_final_output_reuse_v"
         if bool(getattr(self, "triton_reuse_weight_tile", False)):
             direct_backend = "triton_direct_final_output_reuse_w"
@@ -2933,12 +3555,29 @@ class DPETensorMultiMode(object):
                 f"{block_shape_key};mode0_group={input_tile_group};"
                 f"binary_input={int(binary_input_slices)};"
                 f"precomputed_v={int(use_precomputed_v)};"
+                f"reuse_w={int(bool(getattr(self, 'triton_reuse_weight_tile', False)))};"
+                f"fast_adc={int(effective_fast_adc_scale)};"
                 f"warps={int(getattr(self, 'triton_direct_final_num_warps', 4))}"
             ),
         )
         return out
 
     def _can_use_triton_gidx_direct_final_output(self, x, mat) -> bool:
+        gidx = getattr(mat, "G_indices", None)
+        gidx_index_safe = False
+        if gidx is not None and getattr(gidx, "dim", lambda: 0)() == 5:
+            try:
+                # The Triton G-index direct-final kernels form offsets from
+                # tensor strides. Ultra-wide lm_head tensors can have a huge
+                # original P stride even when a small P chunk is sliced later,
+                # which can overflow 32-bit indexing inside the kernel. Fall
+                # back to restored direct-final for those chunks.
+                shape = [int(v) for v in gidx.shape]
+                stride = [int(v) for v in gidx.stride()]
+                max_offset = sum((size - 1) * step for size, step in zip(shape, stride))
+                gidx_index_safe = max_offset < 2_000_000_000
+            except Exception:
+                gidx_index_safe = False
         read_noise_supported = (
             not self._has_read_noise
             or (
@@ -2946,26 +3585,39 @@ class DPETensorMultiMode(object):
                 and self._rv_sigma > 0
             )
         )
-        return (
-            bool(getattr(self, "triton_direct_final_output", False))
-            and bool(getattr(self, "triton_gidx_direct_final_output", True))
-            and self.fast_inference_backend in ("triton", "triton_gidx")
-            and self.mode == 0
-            and not self.radc_is_list
-            and self.rdac >= 2
-            and len(x.shape) == 2
-            and getattr(x, "sliced_data", None) is not None
-            and getattr(mat, "G_indices", None) is not None
-            and getattr(x, "max_data", None) is not None
-            and getattr(mat, "max_data", None) is not None
-            and x.sliced_data.is_cuda
-            and x.max_data.is_cuda
-            and mat.max_data.is_cuda
-            and x.bw_e is None
-            and self.vnoise == 0
-            and read_noise_supported
-            and not self._write_variation_is_virtual()
+        checks = (
+            ("enabled", bool(getattr(self, "triton_direct_final_output", False))),
+            ("gidx_enabled", bool(getattr(self, "triton_gidx_direct_final_output", True))),
+            ("backend", self.fast_inference_backend in ("triton", "triton_gidx")),
+            ("mode", self.mode == 0),
+            ("radc", not self.radc_is_list and self.rdac >= 2),
+            ("rank2", len(x.shape) == 2),
+            ("x_sliced", getattr(x, "sliced_data", None) is not None),
+            ("gidx", gidx is not None),
+            ("gidx_index_safe", gidx_index_safe),
+            ("x_max", getattr(x, "max_data", None) is not None),
+            ("mat_max", getattr(mat, "max_data", None) is not None),
+            ("x_sliced_cuda", getattr(getattr(x, "sliced_data", None), "is_cuda", False)),
+            ("x_max_cuda", getattr(getattr(x, "max_data", None), "is_cuda", False)),
+            ("mat_max_cuda", getattr(getattr(mat, "max_data", None), "is_cuda", False)),
+            ("no_exp_bias", x.bw_e is None),
+            ("no_vnoise", self.vnoise == 0),
+            ("read_noise", read_noise_supported),
+            ("no_virtual_write", not self._write_variation_is_virtual()),
+            (
+                "dtype_guard",
+                not self._mode0_requires_fp32_analog_compute()
+                or self._mode0_vmm_uses_low_precision_override()
+                or self._mode0_fast_policy_requested(),
+            ),
+            ("not_seeded_audit", not self._mode0_seeded_semantic_audit()),
         )
+        for name, ok in checks:
+            if not ok:
+                if bool(getattr(self, "triton_direct_final_output", False)):
+                    self._fastpath_count(f"gidx_direct_final_block_{name}_count")
+                return False
+        return True
 
     def _triton_gidx_direct_final_output(self, x, mat, c0, c1, slice_scale, adc_ref, out_buffer=None):
         if not self._can_use_triton_gidx_direct_final_output(x, mat):
@@ -3023,9 +3675,12 @@ class DPETensorMultiMode(object):
                 block_k=block_k,
                 reuse_weight_tile=bool(getattr(self, "triton_reuse_weight_tile", False)),
                 binary_input_slices=binary_input_slices,
+                num_warps=int(getattr(self, "triton_direct_final_num_warps", 4)),
                 out=out_buffer,
                 out_col_offset=self._direct_output_col_range_2d(mat, c0, c1)[0] if out_buffer is not None else 0,
                 out_cols=int(mat.shape[1]) if out_buffer is not None else None,
+                dot_dtype_override=self._mode0_dot_dtype_override(),
+                deterministic_m_reduce=bool(getattr(self, "triton_gidx_direct_final_deterministic", False)),
             )
         except Exception as exc:
             self._fastpath_count("gidx_direct_final_output_fallback_count")
@@ -3043,6 +3698,8 @@ class DPETensorMultiMode(object):
         if out_buffer is not None:
             self._fastpath_count("gidx_direct_final_output_store_success_count")
         backend = "triton_gidx_direct_final_output"
+        if bool(getattr(self, "triton_gidx_direct_final_deterministic", False)):
+            backend = "triton_gidx_direct_final_output_deterministic"
         if bool(getattr(self, "triton_reuse_weight_tile", False)):
             backend = "triton_gidx_direct_final_output_reuse_w"
         self._profile_stop(
@@ -3052,7 +3709,9 @@ class DPETensorMultiMode(object):
             direct_store=out_buffer is not None,
             shape_key=(
                 f"{block_shape_key};binary_input={int(binary_input_slices)};"
-                f"reuse_w={int(bool(getattr(self, 'triton_reuse_weight_tile', False)))}"
+                f"reuse_w={int(bool(getattr(self, 'triton_reuse_weight_tile', False)))};"
+                f"det_m={int(bool(getattr(self, 'triton_gidx_direct_final_deterministic', False)))};"
+                f"warps={int(getattr(self, 'triton_direct_final_num_warps', 4))}"
             ),
         )
         return out
@@ -3797,6 +4456,146 @@ class DPETensorMultiMode(object):
         )
         return out
 
+    def _requires_strict_grouped_noisy_vmm(self):
+        # This is a diagnostic PyTorch/cuBLAS arithmetic reference, not the
+        # default semantics-preserving CIM execution path.
+        return (
+            bool(getattr(self, "mode0_framework_noisy_vmm_reference", False))
+            and self.mode == 0
+            and bool(getattr(self, "_has_read_noise", False))
+            and bool(getattr(self, "triton_direct_final_exact_reduce", False))
+            and self._mode0_analog_compute_dtype() in (torch.float16, torch.bfloat16)
+        )
+
+    @staticmethod
+    def _strict_grouped_noisy_shape_supported(vin, g_shifted):
+        in_tiles = int(g_shifted.shape[0])
+        out_tiles = int(g_shifted.shape[1])
+        if in_tiles >= 64:
+            return True
+        return 32 <= in_tiles < 64 and 80 <= out_tiles <= 512
+
+    def _strict_serial_noisy_weight_slice_accumulate(
+        self,
+        vin,
+        g_shifted,
+        slice_scale_row,
+        adc_ref,
+        accumulated,
+    ):
+        self._fastpath_count("strict_serial_noisy_vmm_fallback_count")
+        for weight_slice in range(int(g_shifted.shape[2])):
+            if len(vin.shape) == 4:
+                partial = torch.einsum(
+                    "nmjk,mpkl->nmpjl",
+                    vin,
+                    g_shifted[:, :, weight_slice],
+                )
+            elif len(vin.shape) == 5:
+                partial = torch.einsum(
+                    "bnmjk,mpkl->bnmpjl",
+                    vin,
+                    g_shifted[:, :, weight_slice],
+                )
+            else:
+                raise ValueError("Input data must be 2-D or 3-D.")
+            accumulated = self._strict_adc_scale_accumulate(
+                partial,
+                slice_scale_row[weight_slice],
+                adc_ref,
+                accumulated,
+            )
+        return accumulated
+
+    def _strict_adc_scale_accumulate(
+        self,
+        partial,
+        scale,
+        adc_ref,
+        accumulated,
+    ):
+        if partial.is_cuda and scale.is_cuda:
+            try:
+                from .triton_fast_accumulate import triton_strict_adc_scale_accumulate
+
+                output = triton_strict_adc_scale_accumulate(
+                    partial,
+                    scale,
+                    accumulated,
+                    adc_ref=adc_ref,
+                    radc=int(self.radc),
+                )
+                self._fastpath_count("strict_adc_scale_accumulate_triton_success_count")
+                return output
+            except Exception:
+                self._fastpath_count("strict_adc_scale_accumulate_triton_fallback_count")
+        if partial.dtype != self.adc_compute_dtype:
+            partial = partial.to(self.adc_compute_dtype)
+        partial.div_(adc_ref)
+        partial.mul_(self.radc - 1)
+        partial.round_()
+        partial.div_(self.radc - 1)
+        partial.mul_(scale)
+        if accumulated is None:
+            return partial
+        accumulated.add_(partial)
+        return accumulated
+
+    def _strict_grouped_noisy_weight_slice_accumulate(
+        self,
+        vin,
+        g_shifted,
+        slice_scale_row,
+        adc_ref,
+        *,
+        reduce_weight_slices=True,
+        defer_postprocess=False,
+    ):
+        self._fastpath_count("strict_grouped_noisy_vmm_attempt_count")
+        if len(vin.shape) == 4:
+            _rows, in_tiles, _inner_rows, tile_k = [int(v) for v in vin.shape]
+            g_in_tiles, out_tiles, weight_slices, g_tile_k, tile_cols = [
+                int(v) for v in g_shifted.shape
+            ]
+            if in_tiles != g_in_tiles or tile_k != g_tile_k:
+                raise ValueError("Grouped noisy VMM shape mismatch.")
+            partial = torch.einsum("nmjk,mpskl->nmpsjl", vin, g_shifted)
+            scale_view = slice_scale_row.view(1, 1, 1, weight_slices, 1, 1)
+        elif len(vin.shape) == 5:
+            _batch, _rows, in_tiles, _inner_rows, tile_k = [int(v) for v in vin.shape]
+            g_in_tiles, out_tiles, weight_slices, g_tile_k, tile_cols = [
+                int(v) for v in g_shifted.shape
+            ]
+            if in_tiles != g_in_tiles or tile_k != g_tile_k:
+                raise ValueError("Grouped noisy VMM shape mismatch.")
+            partial = torch.einsum("bnmjk,mpskl->bnmpsjl", vin, g_shifted)
+            scale_view = slice_scale_row.view(1, 1, 1, 1, weight_slices, 1, 1)
+        else:
+            raise ValueError("Input data must be 2-D or 3-D.")
+
+        if defer_postprocess:
+            self._fastpath_count("strict_grouped_noisy_vmm_success_count")
+            return partial
+        if partial.dtype != self.adc_compute_dtype:
+            partial = partial.to(self.adc_compute_dtype)
+        if scale_view.dtype != self.adc_compute_dtype:
+            scale_view = scale_view.to(self.adc_compute_dtype)
+        radc_scale = self.radc - 1
+        partial.div_(adc_ref)
+        partial.mul_(radc_scale)
+        partial.round_()
+        partial.div_(radc_scale)
+        partial.mul_(scale_view)
+
+        if not reduce_weight_slices:
+            self._fastpath_count("strict_grouped_noisy_vmm_success_count")
+            return partial
+        output = partial.select(-3, 0).clone()
+        for weight_slice in range(1, int(g_shifted.shape[2])):
+            output.add_(partial.select(-3, weight_slice))
+        self._fastpath_count("strict_grouped_noisy_vmm_success_count")
+        return output
+
     def _fast_weight_slice_accumulate(
         self,
         vin,
@@ -3868,6 +4667,13 @@ class DPETensorMultiMode(object):
             scale_view = slice_scale_row.view(1, 1, 1, 1, -1, 1, 1)
         else:
             raise ValueError("Input data must be 2-D or 3-D.")
+
+        if partial.dtype != self.adc_compute_dtype:
+            token = self._profile_start("fast_adc_promote_fp32")
+            partial = partial.to(self.adc_compute_dtype)
+            self._profile_stop(token)
+        if scale_view.dtype != self.adc_compute_dtype:
+            scale_view = scale_view.to(self.adc_compute_dtype)
 
         token = self._profile_start("fast_adc_round")
         radc_scale = self.radc - 1
@@ -4003,18 +4809,19 @@ class DPETensorMultiMode(object):
         V_in = self.vread * torch.round(x_2d / x_max * (self.rdac - 1)) / (self.rdac - 1)
         if self.vnoise > 0:
             V_in = V_in * (1.0 + torch.randn_like(V_in) * self.vnoise)
+        V_in = V_in.to(self.compute_dtype)
 
         result_2d = torch.zeros((V_in.shape[0], out_features),
-                                device=V_in.device, dtype=V_in.dtype)
+                                device=V_in.device, dtype=torch.float32)
 
         for c0 in range(0, out_features, tile_out):
             c1 = min(c0 + tile_out, out_features)
             if self.mode1_adc_per_tile:
                 out_block = torch.zeros((V_in.shape[0], c1 - c0),
-                                        device=V_in.device, dtype=V_in.dtype)
+                                        device=V_in.device, dtype=torch.float32)
             else:
                 cur_block = torch.zeros((V_in.shape[0], c1 - c0),
-                                        device=V_in.device, dtype=V_in.dtype)
+                                        device=V_in.device, dtype=torch.float32)
 
             for r0 in range(0, in_features, tile_in):
                 r1 = min(r0 + tile_in, in_features)
@@ -4147,6 +4954,7 @@ class DPETensorMultiMode(object):
                 noise_seed=self._read_noise_seed_base,
                 noise_offset_base=noise_offset_base,
                 input_precision=self.triton_input_precision,
+                dot_dtype_override=self._triton_dot_dtype_override(),
                 block_r=int(plan["block_r"]),
                 block_l=int(plan["block_l"]),
                 block_k=int(plan["block_k"]),
@@ -4518,6 +5326,7 @@ class DPETensorMultiMode(object):
         """
         ns_x = len(x.slice_method)
         ns_y = len(mat.slice_method)
+        self.probe_activation_density(x)
         adcRef = (self.HGS - self.LGS) * self.vread * x.sliced_data.shape[-1]
         scale_base = adcRef / self.Q_G / self.vread / (self.g_level - 1)
         chunks = list(self._iter_output_chunks(mat, x=x))
@@ -4556,34 +5365,52 @@ class DPETensorMultiMode(object):
         ):
             mode0_forward_triton_plan = self._mode0_triton_plan_tuple(x, mat)
         mode0_precomputed_v_sliced = None
+        mode0_exact_direct_reduce = bool(getattr(self, "triton_direct_final_exact_reduce", False))
+        mode0_partial_direct = (
+            int(getattr(self, "triton_direct_final_partial_m_group", 0)) > 0
+            or mode0_exact_direct_reduce
+        )
         if (
             use_fast_inference
             and self.mode == 0
             and bool(getattr(self, "triton_direct_final_output", False))
             and bool(getattr(self, "triton_precompute_input_voltage", False))
             and self._can_use_triton_restored_input_slice_fusion(x, mat)
-            and not self._can_use_triton_gidx_direct_final_output(x, mat)
+            and (mode0_partial_direct or not self._can_use_triton_gidx_direct_final_output(x, mat))
             and bool(getattr(self, "triton_binary_input_slice_dac", True))
             and bool(getattr(x, "is_uniform_1bit_slices", False))
-            and not bool(getattr(self, "triton_reuse_input_voltage", False))
-            and not bool(getattr(self, "triton_reuse_weight_tile", False))
         ):
             plan_input_tile_group = (
                 int(mode0_forward_triton_plan[4])
                 if mode0_forward_triton_plan is not None
                 else max(1, int(getattr(self, "triton_mode0_input_tile_group", 1)))
             )
-            if plan_input_tile_group == 1:
-                token_v = self._profile_start("precompute_input_voltage")
-                mode0_precomputed_v_sliced = x.sliced_data.to(self.compute_dtype)
-                mode0_precomputed_v_sliced.mul_(self.vread)
-                self._fastpath_count("precompute_input_voltage_count")
-                self._profile_stop(token_v)
+            # exact_reduce forces the consumer to reduce one input tile at a
+            # time, so precomputed Vin remains valid even when the auto plan
+            # would otherwise choose grouped input tiles for the non-exact path.
+            effective_precompute_group = 1 if mode0_exact_direct_reduce else plan_input_tile_group
+            if effective_precompute_group == 1:
+                fused_v = getattr(x, "precomputed_v_sliced", None)
+                if (
+                    fused_v is not None
+                    and fused_v.is_cuda
+                    and tuple(fused_v.shape) == tuple(x.sliced_data.shape)
+                    and fused_v.dtype == self._mode0_analog_compute_dtype()
+                ):
+                    mode0_precomputed_v_sliced = fused_v
+                    self._fastpath_count("precompute_input_voltage_fused_slice_count")
+                else:
+                    token_v = self._profile_start("precompute_input_voltage")
+                    mode0_precomputed_v_sliced = x.sliced_data.to(self._mode0_analog_compute_dtype())
+                    mode0_precomputed_v_sliced.mul_(self.vread)
+                    self._fastpath_count("precompute_input_voltage_count")
+                    self._profile_stop(token_v)
 
         overlap_restore_direct = (
             bool(getattr(self, "triton_overlap_restore_direct", False))
             and use_fast_inference
             and self.mode == 0
+            and not bool(getattr(self, "triton_mode0_strict_intermediate", False))
             and len(chunks) > 1
             and x.device.type == "cuda"
             and torch.cuda.is_available()
@@ -4615,6 +5442,18 @@ class DPETensorMultiMode(object):
             if next_chunk_index >= len(chunks) or next_chunk_index in restore_prefetch:
                 return
             c0, c1 = chunks[next_chunk_index]
+            try:
+                idx = mat.G_indices[:, c0:c1, :, :, :]
+                restore_dtype = self._mode0_restore_compute_dtype()
+                dtype_bytes = 2 if restore_dtype in (torch.float16, torch.bfloat16) else 4
+                if self._mode0_requires_fp32_analog_compute() and not self._mode0_vmm_uses_low_precision_override():
+                    dtype_bytes = 4
+                restored_bytes = int(idx.numel()) * int(dtype_bytes)
+                if not self._can_reserve_restore_prefetch_bytes(restored_bytes, source="direct"):
+                    self._fastpath_count("overlap_restore_direct_skip_memory_count")
+                    return
+            except Exception:
+                pass
             stream = get_restore_stream()
             current = torch.cuda.current_stream(x.device)
             stream.wait_stream(current)
@@ -4721,6 +5560,28 @@ class DPETensorMultiMode(object):
                 conductance_restored = True
 
             if use_fast_inference:
+                def finalize_gidx_strict_intermediate(accumulated, *, read_noise: bool):
+                    token = self._profile_start("finalize")
+                    if len(x.shape) == 3:
+                        out_chunks.append(self._finalize_inference_chunk_3d(accumulated, x, mat, c0, c1))
+                    else:
+                        fused = self._triton_finalize_inference_chunk_2d(accumulated, x, mat, c0, c1)
+                        finalized = (
+                            fused
+                            if fused is not None
+                            else self._finalize_inference_chunk_2d(accumulated, x, mat, c0, c1)
+                        )
+                        emit_chunk(finalized, c0, c1)
+                        del finalized
+                    self._profile_stop(
+                        token,
+                        c0=c0,
+                        c1=c1,
+                        mode0_strict_intermediate=bool(getattr(self, "triton_mode0_strict_intermediate", False)),
+                        read_noise_input_slice_fused=read_noise,
+                        input_slice_fused=not read_noise,
+                    )
+
                 accumulated = self._triton_gidx_read_noise_input_slice_fused_accumulate(
                     x,
                     mat,
@@ -4730,11 +5591,7 @@ class DPETensorMultiMode(object):
                     adcRef,
                 )
                 if accumulated is not None:
-                    token = self._profile_start("finalize")
-                    finalized = self._finalize_inference_chunk_2d(accumulated, x, mat, c0, c1)
-                    self._profile_stop(token, c0=c0, c1=c1, read_noise_input_slice_fused=True)
-                    emit_chunk(finalized, c0, c1)
-                    del finalized
+                    finalize_gidx_strict_intermediate(accumulated, read_noise=True)
                     del accumulated
                     continue
 
@@ -4747,21 +5604,22 @@ class DPETensorMultiMode(object):
                     adcRef,
                 )
                 if accumulated is not None:
-                    token = self._profile_start("finalize")
-                    if len(x.shape) == 3:
-                        out_chunks.append(self._finalize_inference_chunk_3d(accumulated, x, mat, c0, c1))
-                    else:
-                        finalized = self._finalize_inference_chunk_2d(accumulated, x, mat, c0, c1)
-                        emit_chunk(finalized, c0, c1)
-                        del finalized
-                    self._profile_stop(token, c0=c0, c1=c1, input_slice_fused=True)
+                    finalize_gidx_strict_intermediate(accumulated, read_noise=False)
                     del accumulated
                     continue
 
                 if (
                     self.mode == 0
-                    and self._can_use_triton_restored_input_slice_fusion(x, mat)
+                    and self._can_use_triton_restored_input_slice_fusion(
+                        x,
+                        mat,
+                        allow_seeded_exact=mode0_exact_direct_reduce,
+                    )
                 ):
+                    deterministic_partial_direct = (
+                        int(getattr(self, "triton_direct_final_partial_m_group", 0)) > 0
+                        or bool(getattr(self, "triton_direct_final_exact_reduce", False))
+                    )
                     direct_store_buffer = (
                         ensure_direct_output(torch.float32, zero_once=direct_output_zero_once)
                         if direct_write_output
@@ -4769,7 +5627,10 @@ class DPETensorMultiMode(object):
                     )
                     direct_final = None
                     gidx_direct_attempted = False
-                    if self._can_use_triton_gidx_direct_final_output(x, mat):
+                    if (
+                        not deterministic_partial_direct
+                        and self._can_use_triton_gidx_direct_final_output(x, mat)
+                    ):
                         gidx_direct_attempted = True
                         if direct_store_buffer is not None and not direct_output_zero_once:
                             self._zero_direct_output_chunk_2d(direct_store_buffer, mat, c0, c1)
@@ -5022,6 +5883,55 @@ class DPETensorMultiMode(object):
                                 gn_shifted=Gn_shifted,
                             )
                     else:
+                        if self._requires_strict_grouped_noisy_vmm():
+                            ensure_shifted_conductance()
+                            if self._strict_grouped_noisy_shape_supported(Vin_i, G_shifted):
+                                group_size = 3
+                                for group_start in range(0, ns_y, group_size):
+                                    group_end = min(group_start + group_size, ns_y)
+                                    if group_end - group_start == 1:
+                                        accumulated = self._strict_serial_noisy_weight_slice_accumulate(
+                                            Vin_i,
+                                            G_shifted[:, :, group_start:group_end],
+                                            slice_scale[i, group_start:group_end],
+                                            adcRef,
+                                            accumulated,
+                                        )
+                                        continue
+                                    grouped_partials = self._strict_grouped_noisy_weight_slice_accumulate(
+                                        Vin_i,
+                                        G_shifted[:, :, group_start:group_end],
+                                        slice_scale[i, group_start:group_end],
+                                        adcRef,
+                                        reduce_weight_slices=False,
+                                        defer_postprocess=True,
+                                    )
+                                    for local_slice in range(group_end - group_start):
+                                        grouped_partial = grouped_partials.select(-3, local_slice)
+                                        accumulated = self._strict_adc_scale_accumulate(
+                                            grouped_partial,
+                                            slice_scale[i, group_start + local_slice],
+                                            adcRef,
+                                            accumulated,
+                                        )
+                                    del grouped_partials
+                            else:
+                                accumulated = self._strict_serial_noisy_weight_slice_accumulate(
+                                    Vin_i,
+                                    G_shifted,
+                                    slice_scale[i],
+                                    adcRef,
+                                    accumulated,
+                                )
+                            self._profile_stop(
+                                token,
+                                c0=c0,
+                                c1=c1,
+                                input_slice=i,
+                                strict_grouped_noisy=True,
+                            )
+                            del Vin_i
+                            continue
                         partial = self._triton_gidx_weight_slice_accumulate(
                             Vin_i,
                             mat,
@@ -5166,6 +6076,10 @@ class DPETensorMultiMode(object):
                         self._profile_stop(token, c0=c0, c1=c1, input_slice=i, weight_slice=j)
 
                     if not adc_already_applied:
+                        if partial.dtype != self.adc_compute_dtype:
+                            token = self._profile_start("adc_promote_fp32")
+                            partial = partial.to(self.adc_compute_dtype)
+                            self._profile_stop(token, c0=c0, c1=c1, input_slice=i, weight_slice=j)
                         token = self._profile_start("adc")
                         radc_j = self.radc[j] if self.radc_is_list else self.radc
                         partial.div_(adcRef)
@@ -5228,6 +6142,7 @@ class DPETensorMultiMode(object):
         Returns:
             torch.Tensor: ADC-quantized intermediate output.
         """
+        out = out.to(self.adc_compute_dtype)
         if self.radc_is_list:
             return torch.round(out / adcRef * (self.radc.view(1, 1, 1, 1, -1, 1, 1) - 1)) / \
                    (self.radc.view(1, 1, 1, 1, -1, 1, 1) - 1)
@@ -5244,6 +6159,7 @@ class DPETensorMultiMode(object):
         Returns:
             torch.Tensor: ADC-quantized batched intermediate output.
         """
+        out = out.to(self.adc_compute_dtype)
         if self.radc_is_list:
             return torch.round(out / adcRef * (self.radc.view(1, 1, 1, 1, 1, -1, 1, 1) - 1)) / \
                    (self.radc.view(1, 1, 1, 1, 1, -1, 1, 1) - 1)
@@ -5264,6 +6180,7 @@ class DPETensorMultiMode(object):
             torch.Tensor: Reconstructed 2-D matrix multiplication result.
         """
         QG = self.Q_G
+        out = out.to(self.adc_compute_dtype)
         out = torch.mul(out, x.sliced_max_weights.reshape(1, 1, 1, -1, 1, 1, 1))
         out = (torch.mul(out, mat.sliced_max_weights.reshape(1, 1, 1, 1, -1, 1, 1))
                / QG / self.vread / (self.g_level - 1) * adcRef)
@@ -5276,7 +6193,7 @@ class DPETensorMultiMode(object):
             sw.reshape(1, 1, 1, -1, 1, 1),
         ).sum(dim=3)
         if x.bw_e is None:
-            bm = torch.einsum("nmij, mpij->nmpij", x.max_data, mat.max_data)
+            bm = torch.einsum("nmij, mpij->nmpij", x.max_data.to(torch.float32), mat.max_data.to(torch.float32))
             x_qmax = self._sliced_quant_qmax(x)
             mat_qmax = self._sliced_quant_qmax(mat)
             out = (out * bm
@@ -5303,6 +6220,7 @@ class DPETensorMultiMode(object):
             torch.Tensor: Reconstructed batched matrix multiplication result.
         """
         QG = self.Q_G
+        out = out.to(self.adc_compute_dtype)
         out = torch.mul(out, x.sliced_max_weights.reshape(1, 1, 1, 1, -1, 1, 1, 1))
         out = (torch.mul(out, mat.sliced_max_weights.reshape(1, 1, 1, 1, 1, -1, 1, 1))
                / QG / self.vread / (self.g_level - 1) * adcRef)
@@ -5315,7 +6233,7 @@ class DPETensorMultiMode(object):
             sw.reshape(1, 1, 1, 1, -1, 1, 1),
         ).sum(dim=4)
         if x.bw_e is None:
-            bm = torch.einsum("bnmij, mpij->bnmpij", x.max_data, mat.max_data)
+            bm = torch.einsum("bnmij, mpij->bnmpij", x.max_data.to(torch.float32), mat.max_data.to(torch.float32))
             x_qmax = self._sliced_quant_qmax(x)
             mat_qmax = self._sliced_quant_qmax(mat)
             out = (out * bm

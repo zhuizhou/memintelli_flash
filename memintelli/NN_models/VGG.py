@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, List, Dict, Any, cast, Optional
-from memintelli.NN_layers import Conv2dMem, LinearMem
+from memintelli.NN_layers import Conv2dMem, LinearMem, tensor_bytes
 
 # timm model names on HuggingFace (timm/xxx)
 timm_model_names: Dict[str, str] = {
@@ -277,8 +277,7 @@ class VGG(nn.Module):
             sz = 0
             for attr in ('G_indices', 'G', 'max_data', 'e_bias'):
                 t = m._pinned_buffers.get(attr)
-                if t is not None:
-                    sz += t.nelement() * t.element_size()
+                sz += tensor_bytes(t)
             layer_g_sizes.append(sz)
             total_g_bytes += sz
         
