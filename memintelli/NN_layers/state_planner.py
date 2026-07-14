@@ -32,6 +32,8 @@ class OutputBlockPlan:
     execution_peak_bytes: int
     estimated_peak_bytes: int
     full_layer_peak_bytes: int
+    execution_window_cols: int
+    execution_window_bytes: int
     manual_override: bool
 
     @property
@@ -161,8 +163,208 @@ def estimate_mode0_workspace(
     )
 
 
+def estimate_mode1_workspace(
+    *,
+    tokens,
+    in_features,
+    out_features,
+    array_rows,
+    array_cols,
+    read_variation=0.0,
+    weight_bytes=2,
+    index_bytes=1,
+    scale_bytes=4,
+    vin_bytes=2,
+    gdiff_bytes=2,
+    output_bytes=4,
+    execution_window_cols=0,
+    streaming_prefetch_window=0,
+):
+    del read_variation
+    padded_in = _align_up(in_features, array_rows)
+    padded_out = _align_up(out_features, array_cols)
+    requested_window = int(execution_window_cols or out_features)
+    window_cols = min(padded_out, _align_up(requested_window, array_cols))
+    weight_elements = padded_in * padded_out
+
+    original_weight = weight_elements * int(weight_bytes)
+    pair_indices = 2 * weight_elements * int(index_bytes)
+    scale_grid = (
+        math.ceil(padded_in / int(array_rows))
+        * math.ceil(padded_out / int(array_cols))
+        * int(scale_bytes)
+    )
+    signed_vin = int(tokens) * padded_in * int(vin_bytes)
+    current_gdiff = padded_in * window_cols * int(gdiff_bytes)
+    prefetched_gdiff = current_gdiff * max(0, int(streaming_prefetch_window or 0))
+    output = int(tokens) * padded_out * int(output_bytes)
+
+    preparation_peak = original_weight + pair_indices + scale_grid
+    execution_peak = (
+        pair_indices
+        + scale_grid
+        + signed_vin
+        + current_gdiff
+        + prefetched_gdiff
+        + output
+    )
+    return WorkspaceEstimate(
+        preparation_peak_bytes=preparation_peak,
+        execution_peak_bytes=execution_peak,
+        peak_bytes=max(preparation_peak, execution_peak),
+    )
+
+
+def _plan_mode1_output_block(
+    *,
+    tokens,
+    in_features,
+    out_features,
+    array_rows,
+    array_cols,
+    cuda_peak_budget_mb,
+    base_allocated_mb,
+    resident_state_mb,
+    safety_margin_mb,
+    manual_output_block_cols,
+    read_variation,
+    streaming_prefetch_window,
+    index_bytes,
+    gdiff_bytes,
+    vin_bytes,
+    scale_bytes,
+    output_bytes,
+    minimum_output_block_cols,
+    maximum_output_block_cols,
+):
+    base_allocated_bytes = max(0, int(float(base_allocated_mb) * MIB))
+    resident_state_bytes = max(0, int(float(resident_state_mb) * MIB))
+    safety_margin_bytes = max(0, int(float(safety_margin_mb) * MIB))
+    requested_budget_bytes = max(0, int(float(cuda_peak_budget_mb or 0.0) * MIB))
+    minimum_block_cols = min(
+        int(out_features),
+        _align_up(max(int(array_cols), int(minimum_output_block_cols or 0)), int(array_cols)),
+    )
+    maximum_block_cols = int(out_features)
+    if int(maximum_output_block_cols or 0) > 0:
+        maximum_block_cols = min(
+            maximum_block_cols,
+            max(
+                minimum_block_cols,
+                (int(maximum_output_block_cols) // int(array_cols)) * int(array_cols),
+            ),
+        )
+
+    def estimate(block_cols, window_cols):
+        return estimate_mode1_workspace(
+            tokens=tokens,
+            in_features=in_features,
+            out_features=block_cols,
+            array_rows=array_rows,
+            array_cols=array_cols,
+            read_variation=read_variation,
+            index_bytes=index_bytes,
+            gdiff_bytes=gdiff_bytes,
+            vin_bytes=vin_bytes,
+            scale_bytes=scale_bytes,
+            output_bytes=output_bytes,
+            execution_window_cols=window_cols,
+            streaming_prefetch_window=streaming_prefetch_window,
+        )
+
+    full_estimate = estimate(int(out_features), int(out_features))
+    if requested_budget_bytes <= 0:
+        return OutputBlockPlan(
+            output_block_cols=int(out_features),
+            shard_count=1,
+            workspace_budget_bytes=full_estimate.peak_bytes,
+            base_allocated_bytes=base_allocated_bytes,
+            resident_state_bytes=resident_state_bytes,
+            safety_margin_bytes=safety_margin_bytes,
+            preparation_peak_bytes=full_estimate.preparation_peak_bytes,
+            execution_peak_bytes=full_estimate.execution_peak_bytes,
+            estimated_peak_bytes=full_estimate.peak_bytes,
+            full_layer_peak_bytes=full_estimate.peak_bytes,
+            execution_window_cols=int(out_features),
+            execution_window_bytes=(
+                _align_up(in_features, array_rows)
+                * _align_up(out_features, array_cols)
+                * int(gdiff_bytes)
+            ),
+            manual_override=False,
+        )
+
+    maximum_resident_bytes = max(
+        0,
+        requested_budget_bytes - base_allocated_bytes - safety_margin_bytes,
+    )
+    resident_state_bytes = min(resident_state_bytes, maximum_resident_bytes)
+    workspace_budget = max(
+        0,
+        requested_budget_bytes
+        - base_allocated_bytes
+        - resident_state_bytes
+        - safety_margin_bytes,
+    )
+
+    if int(manual_output_block_cols or 0) > 0:
+        block_cols = min(
+            int(out_features),
+            _align_up(manual_output_block_cols, array_cols),
+        )
+    else:
+        low = max(1, math.ceil(minimum_block_cols / int(array_cols)))
+        high = max(low, math.ceil(maximum_block_cols / int(array_cols)))
+        best = low
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = min(int(out_features), mid * int(array_cols))
+            candidate_estimate = estimate(candidate, min(candidate, int(array_cols)))
+            if candidate_estimate.peak_bytes <= workspace_budget:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        block_cols = min(int(out_features), best * int(array_cols))
+
+    low = 1
+    high = max(1, math.ceil(block_cols / int(array_cols)))
+    best_window_tiles = 1
+    while low <= high:
+        mid = (low + high) // 2
+        window_cols = min(block_cols, mid * int(array_cols))
+        candidate_estimate = estimate(block_cols, window_cols)
+        if candidate_estimate.peak_bytes <= workspace_budget:
+            best_window_tiles = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    execution_window_cols = min(block_cols, best_window_tiles * int(array_cols))
+    selected = estimate(block_cols, execution_window_cols)
+    return OutputBlockPlan(
+        output_block_cols=block_cols,
+        shard_count=math.ceil(int(out_features) / block_cols),
+        workspace_budget_bytes=workspace_budget,
+        base_allocated_bytes=base_allocated_bytes,
+        resident_state_bytes=resident_state_bytes,
+        safety_margin_bytes=safety_margin_bytes,
+        preparation_peak_bytes=selected.preparation_peak_bytes,
+        execution_peak_bytes=selected.execution_peak_bytes,
+        estimated_peak_bytes=selected.peak_bytes,
+        full_layer_peak_bytes=full_estimate.peak_bytes,
+        execution_window_cols=execution_window_cols,
+        execution_window_bytes=(
+            _align_up(in_features, array_rows)
+            * _align_up(execution_window_cols, array_cols)
+            * int(gdiff_bytes)
+        ),
+        manual_override=bool(manual_output_block_cols),
+    )
+
+
 def plan_output_block(
     *,
+    mode=0,
     tokens,
     in_features,
     out_features,
@@ -187,7 +389,35 @@ def plan_output_block(
     output_bytes=2,
     minimum_output_block_cols=0,
     maximum_output_block_cols=0,
+    index_bytes=1,
+    gdiff_bytes=2,
+    vin_bytes=2,
+    scale_bytes=4,
 ):
+    if int(mode) == 1:
+        return _plan_mode1_output_block(
+            tokens=tokens,
+            in_features=in_features,
+            out_features=out_features,
+            array_rows=array_rows,
+            array_cols=array_cols,
+            cuda_peak_budget_mb=cuda_peak_budget_mb,
+            base_allocated_mb=base_allocated_mb,
+            resident_state_mb=resident_state_mb,
+            safety_margin_mb=safety_margin_mb,
+            manual_output_block_cols=manual_output_block_cols,
+            read_variation=read_variation,
+            streaming_prefetch_window=streaming_prefetch_window,
+            index_bytes=index_bytes,
+            gdiff_bytes=gdiff_bytes,
+            vin_bytes=vin_bytes,
+            scale_bytes=scale_bytes,
+            output_bytes=output_bytes,
+            minimum_output_block_cols=minimum_output_block_cols,
+            maximum_output_block_cols=maximum_output_block_cols,
+        )
+    if int(mode) != 0:
+        raise ValueError(f"unsupported planning mode: {mode}")
     base_allocated_bytes = max(0, int(float(base_allocated_mb) * MIB))
     resident_state_bytes = max(0, int(float(resident_state_mb) * MIB))
     safety_margin_bytes = max(0, int(float(safety_margin_mb) * MIB))
@@ -295,6 +525,8 @@ def plan_output_block(
             execution_peak_bytes=estimate.execution_peak_bytes,
             estimated_peak_bytes=estimate.peak_bytes,
             full_layer_peak_bytes=full_estimate.peak_bytes,
+            execution_window_cols=block_cols,
+            execution_window_bytes=0,
             manual_override=True,
         )
 
@@ -310,6 +542,8 @@ def plan_output_block(
             execution_peak_bytes=full_estimate.execution_peak_bytes,
             estimated_peak_bytes=full_estimate.peak_bytes,
             full_layer_peak_bytes=full_estimate.peak_bytes,
+            execution_window_cols=int(out_features),
+            execution_window_bytes=0,
             manual_override=False,
         )
 
@@ -377,6 +611,8 @@ def plan_output_block(
         execution_peak_bytes=estimate.execution_peak_bytes,
         estimated_peak_bytes=estimate.peak_bytes,
         full_layer_peak_bytes=full_estimate.peak_bytes,
+        execution_window_cols=block_cols,
+        execution_window_bytes=0,
         manual_override=False,
     )
 

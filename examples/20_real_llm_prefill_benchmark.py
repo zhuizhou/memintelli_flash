@@ -1548,11 +1548,12 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0, terminal_layer=
         else 0
     )
     plan = plan_output_block(
+        mode=int(getattr(args, "mode", 0)),
         tokens=max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
         in_features=int(child.in_features),
         out_features=int(child.out_features),
-        input_slices=max(1, len(input_slices)),
-        weight_slices=max(1, len(weight_slices)),
+        input_slices=(1 if int(getattr(args, "mode", 0)) == 1 else max(1, len(input_slices))),
+        weight_slices=(1 if int(getattr(args, "mode", 0)) == 1 else max(1, len(weight_slices))),
         array_rows=weight_tiles[0],
         array_cols=weight_tiles[1],
         cuda_peak_budget_mb=cuda_budget_mb,
@@ -1569,6 +1570,9 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0, terminal_layer=
         compressed_state_bytes=compressed_state_bytes,
         restored_conductance_bytes=restored_conductance_bytes,
         output_bytes=4 if execution_strategy == "direct_final" else 2,
+        index_bytes=compressed_state_bytes,
+        gdiff_bytes=2 if vmm_dtype in {"float16", "bfloat16"} else 4,
+        vin_bytes=2 if vmm_dtype in {"float16", "bfloat16"} else 4,
         minimum_output_block_cols=(
             execution_window_cols
             if execution_strategy == "direct_final"
@@ -1635,11 +1639,12 @@ def plan_model_resident_budget(args, model):
             continue
         layer_specs.append(
             {
+                "mode": int(getattr(args, "mode", 0)),
                 "tokens": max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
                 "in_features": int(child.in_features),
                 "out_features": int(child.out_features),
-                "input_slices": input_slices,
-                "weight_slices": weight_slices,
+                "input_slices": (1 if int(getattr(args, "mode", 0)) == 1 else input_slices),
+                "weight_slices": (1 if int(getattr(args, "mode", 0)) == 1 else weight_slices),
                 "array_rows": weight_tiles[0],
                 "array_cols": weight_tiles[1],
                 "read_variation": read_variation,
@@ -1655,6 +1660,9 @@ def plan_model_resident_budget(args, model):
                 "compressed_state_bytes": compressed_state_bytes,
                 "restored_conductance_bytes": restored_conductance_bytes,
                 "output_bytes": 4 if execution_strategy == "direct_final" else 2,
+                "index_bytes": compressed_state_bytes,
+                "gdiff_bytes": 2 if vmm_dtype in {"float16", "bfloat16"} else 4,
+                "vin_bytes": 2 if vmm_dtype in {"float16", "bfloat16"} else 4,
                 "minimum_output_block_cols": (
                     output_chunk_tiles * weight_tiles[1]
                     if execution_strategy == "direct_final"
@@ -4902,11 +4910,12 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0, terminal_layer=
         else 0
     )
     plan = plan_output_block(
+        mode=int(getattr(args, "mode", 0)),
         tokens=max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
         in_features=int(child.in_features),
         out_features=int(child.out_features),
-        input_slices=max(1, len(input_slices)),
-        weight_slices=max(1, len(weight_slices)),
+        input_slices=(1 if int(getattr(args, "mode", 0)) == 1 else max(1, len(input_slices))),
+        weight_slices=(1 if int(getattr(args, "mode", 0)) == 1 else max(1, len(weight_slices))),
         array_rows=weight_tiles[0],
         array_cols=weight_tiles[1],
         cuda_peak_budget_mb=cuda_budget_mb,
@@ -4923,6 +4932,9 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0, terminal_layer=
         compressed_state_bytes=compressed_state_bytes,
         restored_conductance_bytes=restored_conductance_bytes,
         output_bytes=4 if execution_strategy == "direct_final" else 2,
+        index_bytes=compressed_state_bytes,
+        gdiff_bytes=2 if vmm_dtype in {"float16", "bfloat16"} else 4,
+        vin_bytes=2 if vmm_dtype in {"float16", "bfloat16"} else 4,
         minimum_output_block_cols=(
             execution_window_cols
             if execution_strategy == "direct_final"
@@ -4989,11 +5001,12 @@ def plan_model_resident_budget(args, model):
             continue
         layer_specs.append(
             {
+                "mode": int(getattr(args, "mode", 0)),
                 "tokens": max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
                 "in_features": int(child.in_features),
                 "out_features": int(child.out_features),
-                "input_slices": input_slices,
-                "weight_slices": weight_slices,
+                "input_slices": (1 if int(getattr(args, "mode", 0)) == 1 else input_slices),
+                "weight_slices": (1 if int(getattr(args, "mode", 0)) == 1 else weight_slices),
                 "array_rows": weight_tiles[0],
                 "array_cols": weight_tiles[1],
                 "read_variation": read_variation,
@@ -5009,6 +5022,9 @@ def plan_model_resident_budget(args, model):
                 "compressed_state_bytes": compressed_state_bytes,
                 "restored_conductance_bytes": restored_conductance_bytes,
                 "output_bytes": 4 if execution_strategy == "direct_final" else 2,
+                "index_bytes": compressed_state_bytes,
+                "gdiff_bytes": 2 if vmm_dtype in {"float16", "bfloat16"} else 4,
+                "vin_bytes": 2 if vmm_dtype in {"float16", "bfloat16"} else 4,
                 "minimum_output_block_cols": (
                     output_chunk_tiles * weight_tiles[1]
                     if execution_strategy == "direct_final"
