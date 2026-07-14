@@ -124,6 +124,9 @@ class DPETensorMultiMode(object):
         triton_gidx_direct_final_deterministic=False,
         triton_mode1_gidx_direct_final=True,
         triton_mode1_gdiff_direct_final=True,
+        mode1_gdiff_policy="wide",
+        triton_mode1_deterministic_reduce=True,
+        triton_mode1_deterministic_group=4,
         triton_mode1_input_tile_group=1,
         triton_mode1_chunked_direct_final=True,
         mode1_require_fastpath=False,
@@ -318,6 +321,12 @@ class DPETensorMultiMode(object):
                 the full input dimension spans multiple Mode-1 tiles.
             triton_mode1_gdiff_direct_final (bool): Store and execute one
                 signed differential conductance index when read variation is zero.
+            mode1_gdiff_policy (str): Differential-index placement policy:
+                "off", "wide" for chunked output layers, or "all".
+            triton_mode1_deterministic_reduce (bool): At zero read variation,
+                write grouped partials and reduce them without output atomics.
+            triton_mode1_deterministic_group (int): Input tiles processed by
+                each deterministic partial program.
             triton_mode1_chunked_direct_final (bool): Try Mode-1 direct-final
                 on output chunks for very wide layers. The shape-aware plan
                 keeps regular MLP layers whole and chunks lm_head-like layers
@@ -481,6 +490,11 @@ class DPETensorMultiMode(object):
             self.triton_fast_adc_scale = False
         self.triton_mode1_gidx_direct_final = bool(triton_mode1_gidx_direct_final)
         self.triton_mode1_gdiff_direct_final = bool(triton_mode1_gdiff_direct_final)
+        if mode1_gdiff_policy not in ("off", "wide", "all"):
+            raise ValueError("mode1_gdiff_policy must be 'off', 'wide', or 'all'.")
+        self.mode1_gdiff_policy = mode1_gdiff_policy
+        self.triton_mode1_deterministic_reduce = bool(triton_mode1_deterministic_reduce)
+        self.triton_mode1_deterministic_group = max(2, int(triton_mode1_deterministic_group))
         self.triton_mode1_input_tile_group = max(1, int(triton_mode1_input_tile_group))
         self.triton_mode1_chunked_direct_final = bool(triton_mode1_chunked_direct_final)
         self.mode1_require_fastpath = bool(mode1_require_fastpath)
@@ -733,6 +747,7 @@ class DPETensorMultiMode(object):
             "mode1_gdiff_direct_final_attempt_count": 0,
             "mode1_gdiff_direct_final_success_count": 0,
             "mode1_gdiff_direct_final_fallback_count": 0,
+            "mode1_deterministic_reduce_success_count": 0,
             "mode1_gidx_strided_operand_count": 0,
             "mode1_chunked_direct_final_attempt_count": 0,
             "mode1_chunked_direct_final_success_count": 0,
@@ -1719,6 +1734,12 @@ class DPETensorMultiMode(object):
                     and not self._has_read_noise
                     and not self._write_variation_is_virtual()
                 )
+                gdiff_policy = getattr(self, "mode1_gdiff_policy", "wide")
+                if gdiff_policy == "off":
+                    use_gdiff = False
+                elif use_gdiff and gdiff_policy == "wide":
+                    output_tiles = (int(mat.shape[1]) + int(tile_out) - 1) // int(tile_out)
+                    use_gdiff = output_tiles > self._mode1_triton_chunk_limit(output_tiles, mat=mat)
                 if use_gdiff:
                     gdiff = gp_idx.to(torch.int16) - gn_idx.to(torch.int16)
                     if self.g_level - 1 <= torch.iinfo(torch.int8).max:
@@ -5007,6 +5028,16 @@ class DPETensorMultiMode(object):
                 noise_offset_base = self._read_noise_restore_counter * primary_chunk.numel() * 2
                 self._read_noise_restore_counter += 1
             kernel = triton_mode1_gdiff_direct_final if use_gdiff else triton_mode1_gidx_direct_final
+            deterministic_reduce = bool(
+                getattr(self, "triton_mode1_deterministic_reduce", False)
+                and not self._has_read_noise
+            )
+            input_tile_group = int(plan["input_tile_group"])
+            if deterministic_reduce:
+                input_tile_group = max(
+                    input_tile_group,
+                    int(getattr(self, "triton_mode1_deterministic_group", 4)),
+                )
             kernel_args = (
                 (x_2d, primary_chunk, scale_chunk)
                 if use_gdiff
@@ -5032,7 +5063,8 @@ class DPETensorMultiMode(object):
                 block_r=int(plan["block_r"]),
                 block_l=int(plan["block_l"]),
                 block_k=int(plan["block_k"]),
-                input_tile_group=int(plan["input_tile_group"]),
+                input_tile_group=input_tile_group,
+                deterministic_reduce=deterministic_reduce,
             )
         except Exception as exc:
             self._fastpath_count("mode1_gidx_direct_final_fallback_count")
@@ -5049,7 +5081,9 @@ class DPETensorMultiMode(object):
         self._fastpath_count("mode1_gidx_direct_final_success_count")
         if use_gdiff:
             self._fastpath_count("mode1_gdiff_direct_final_success_count")
-        if int(plan["input_tile_group"]) > 1:
+        if deterministic_reduce:
+            self._fastpath_count("mode1_deterministic_reduce_success_count")
+        if input_tile_group > 1:
             self._fastpath_count("mode1_gidx_direct_final_grouped_success_count")
         self._profile_stop(
             token,
@@ -5058,7 +5092,7 @@ class DPETensorMultiMode(object):
             shape_key=(
                 f"rows={int(x_2d.shape[0])};in={int(x_2d.shape[1])};"
                 f"out={int(out_end - out_start)};tile={int(tile_in)}x{int(tile_out)};"
-                f"group={int(plan['input_tile_group'])};"
+                f"group={input_tile_group};deterministic={int(deterministic_reduce)};"
                 f"read={bool(self._has_read_noise)};{plan['shape_key']}"
             ),
         )

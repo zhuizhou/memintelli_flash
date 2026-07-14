@@ -36,6 +36,7 @@ def build_mode1_engine(
     require_fastpath: bool,
     input_tile_group: int = 1,
     use_gdiff: bool = True,
+    deterministic_reduce: bool = True,
 ) -> DPETensorMultiMode:
     return DPETensorMultiMode(
         HGS=1e-5,
@@ -57,6 +58,8 @@ def build_mode1_engine(
         triton_auto_config=True,
         triton_mode1_gidx_direct_final=True,
         triton_mode1_gdiff_direct_final=bool(use_gdiff),
+        mode1_gdiff_policy="all" if use_gdiff else "off",
+        triton_mode1_deterministic_reduce=bool(deterministic_reduce),
         triton_mode1_chunked_direct_final=True,
         triton_mode1_input_tile_group=int(input_tile_group),
         mode1_grouped_tile_gemm=False,
@@ -236,6 +239,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--input-tile-group", type=int, default=1)
+    parser.add_argument("--deterministic-reduce", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--json-out")
     args = parser.parse_args()
 
@@ -254,6 +258,7 @@ def main() -> None:
         require_fastpath=False,
         input_tile_group=args.input_tile_group,
         use_gdiff=False,
+        deterministic_reduce=args.deterministic_reduce,
     )
     pair_x_sliced = prepare_mode1_tensor(pair_preparation_engine, x, is_weight=False)
     pair_weight_sliced = prepare_mode1_tensor(pair_preparation_engine, weight, is_weight=True)
@@ -268,6 +273,7 @@ def main() -> None:
             require_fastpath=False,
             input_tile_group=args.input_tile_group,
             use_gdiff=True,
+            deterministic_reduce=args.deterministic_reduce,
         )
         gdiff_x_sliced = prepare_mode1_tensor(gdiff_preparation_engine, x, is_weight=False)
         gdiff_weight_sliced = prepare_mode1_tensor(gdiff_preparation_engine, weight, is_weight=True)
@@ -297,6 +303,7 @@ def main() -> None:
             require_fastpath=False,
             input_tile_group=args.input_tile_group,
             use_gdiff=False,
+            deterministic_reduce=args.deterministic_reduce,
         )
         result["paths"]["reference"] = benchmark_path(
             reference,
@@ -314,6 +321,7 @@ def main() -> None:
             require_fastpath=True,
             input_tile_group=args.input_tile_group,
             use_gdiff=False,
+            deterministic_reduce=args.deterministic_reduce,
         )
         result["paths"]["pair_direct"] = benchmark_path(
             optimized,
@@ -331,6 +339,7 @@ def main() -> None:
             require_fastpath=True,
             input_tile_group=args.input_tile_group,
             use_gdiff=True,
+            deterministic_reduce=args.deterministic_reduce,
         )
         result["paths"]["gdiff_direct"] = benchmark_path(
             optimized_gdiff,

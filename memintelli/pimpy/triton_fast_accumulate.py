@@ -6943,6 +6943,7 @@ if triton is not None:
         gn_s1: tl.constexpr,
         ws_s0: tl.constexpr,
         ws_s1: tl.constexpr,
+        out_sg: tl.constexpr,
         out_s0: tl.constexpr,
         out_s1: tl.constexpr,
         R: tl.constexpr,
@@ -6966,6 +6967,7 @@ if triton is not None:
         USE_READ_NOISE: tl.constexpr,
         USE_GDIFF: tl.constexpr,
         USE_ATOMIC: tl.constexpr,
+        WRITE_PARTIAL: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_L: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -7056,7 +7058,13 @@ if triton is not None:
             ).to(tl.float32)
             tile_total += q * (adc_ref_tile * scale_val * (safe_xmax / C2W_DENOM))
 
-        if USE_ATOMIC:
+        if WRITE_PARTIAL:
+            tl.store(
+                out + pid_ig * out_sg + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                tile_total,
+                mask=mask_r[:, None] & mask_l[None, :],
+            )
+        elif USE_ATOMIC:
             tl.atomic_add(
                 out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
                 tile_total,
@@ -8466,6 +8474,7 @@ def triton_mode1_gidx_direct_final(
     block_k: int = 64,
     input_tile_group: int = 1,
     use_gdiff: bool = False,
+    deterministic_reduce: bool = False,
 ) -> torch.Tensor:
     """Run mode-1 compressed differential-pair VMM directly into final output.
 
@@ -8531,14 +8540,27 @@ def triton_mode1_gidx_direct_final(
     num_r_blocks = triton.cdiv(rows, block_r)
     num_l_blocks = triton.cdiv(tile_out, block_l)
     input_tile_group = max(1, min(int(input_tile_group), int(in_tiles)))
+    if deterministic_reduce and in_tiles > 1:
+        input_tile_group = max(2, min(int(input_tile_group), int(in_tiles)))
     if input_tile_group > 1:
         in_tile_groups = triton.cdiv(in_tiles, input_tile_group)
-        use_atomic = in_tile_groups > 1
-        out = (
-            torch.zeros((rows, out_cols), device=x0.device, dtype=torch.float32)
-            if use_atomic
-            else torch.empty((rows, out_cols), device=x0.device, dtype=torch.float32)
-        )
+        write_partial = bool(deterministic_reduce and in_tile_groups > 1)
+        use_atomic = bool(in_tile_groups > 1 and not write_partial)
+        if write_partial:
+            out = torch.empty(
+                (in_tile_groups, rows, out_cols),
+                device=x0.device,
+                dtype=torch.float32,
+            )
+            out_sg, out_s0, out_s1 = out.stride()
+        else:
+            out = (
+                torch.zeros((rows, out_cols), device=x0.device, dtype=torch.float32)
+                if use_atomic
+                else torch.empty((rows, out_cols), device=x0.device, dtype=torch.float32)
+            )
+            out_sg = 0
+            out_s0, out_s1 = out.stride()
         grid = (num_r_blocks * in_tile_groups * out_tiles * num_l_blocks,)
         _mode1_gidx_direct_final_grouped_kernel[grid](
             x0,
@@ -8555,8 +8577,9 @@ def triton_mode1_gidx_direct_final(
             gn.stride(1),
             ws.stride(0),
             ws.stride(1),
-            out.stride(0),
-            out.stride(1),
+            out_sg,
+            out_s0,
+            out_s1,
             rows,
             cols,
             out_cols,
@@ -8578,6 +8601,7 @@ def triton_mode1_gidx_direct_final(
             use_read_noise,
             bool(use_gdiff),
             bool(use_atomic),
+            write_partial,
             int(block_r),
             int(block_l),
             int(block_k),
@@ -8588,6 +8612,8 @@ def triton_mode1_gidx_direct_final(
             input_tile_group,
             num_warps=4,
         )
+        if write_partial:
+            return out.sum(dim=0)
         return out
 
     out = torch.zeros((rows, out_cols), device=x0.device, dtype=torch.float32)
@@ -8664,6 +8690,7 @@ def triton_mode1_gdiff_direct_final(
     block_l: int = 16,
     block_k: int = 64,
     input_tile_group: int = 1,
+    deterministic_reduce: bool = False,
 ) -> torch.Tensor:
     """Run Mode-1 direct-final from one signed differential level tensor."""
     return triton_mode1_gidx_direct_final(
@@ -8691,6 +8718,7 @@ def triton_mode1_gdiff_direct_final(
         block_k=block_k,
         input_tile_group=input_tile_group,
         use_gdiff=True,
+        deterministic_reduce=deterministic_reduce,
     )
 
 

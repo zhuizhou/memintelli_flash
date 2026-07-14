@@ -6,7 +6,7 @@ from memintelli.pimpy.data_formats_multimode import SlicedDataMultiMode
 from memintelli.pimpy.memmat_tensor_multimode import DPETensorMultiMode
 
 
-def _engine(read_var: float) -> DPETensorMultiMode:
+def _engine(read_var: float, *, policy: str = "all") -> DPETensorMultiMode:
     return DPETensorMultiMode(
         write_variation=0.0,
         read_variation=read_var,
@@ -19,6 +19,7 @@ def _engine(read_var: float) -> DPETensorMultiMode:
         fast_inference=True,
         fast_inference_backend="triton_gidx",
         triton_mode1_gdiff_direct_final=True,
+        mode1_gdiff_policy=policy,
         device=torch.device("cpu"),
     )
 
@@ -55,6 +56,13 @@ def test_mode1_read_variation_keeps_independent_branch_indices():
     assert weight.mode1_gdiff_indices is None
     assert isinstance(weight.G_indices, tuple)
     assert len(weight.G_indices) == 2
+
+
+def test_mode1_wide_policy_keeps_regular_layers_on_pair_indices():
+    weight = _weight(_engine(read_var=0.0, policy="wide"))
+
+    assert weight.mode1_gdiff_indices is None
+    assert isinstance(weight.G_indices, tuple)
 
 
 def test_mode1_torch_reference_runs_from_signed_difference_indices():
