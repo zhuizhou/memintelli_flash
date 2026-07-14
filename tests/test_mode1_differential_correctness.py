@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from examples.mode1_differential_benchmark import (
+    build_mode1_engine,
     compare_mode1_outputs,
     run_mode1_comparison,
 )
@@ -18,6 +19,21 @@ def test_compare_mode1_outputs_reports_exact_match():
     assert metrics["max_abs"] == 0.0
     assert metrics["mean_abs"] == 0.0
     assert metrics["cosine_similarity"] == pytest.approx(1.0)
+
+
+def test_mode1_benchmark_can_select_gdiff_direct_path():
+    engine = build_mode1_engine(
+        torch.device("cpu"),
+        backend="torch",
+        read_var=0.05,
+        dtype=torch.bfloat16,
+        require_fastpath=False,
+        gdiff_direct=True,
+        gdiff_schedule="grouped",
+    )
+
+    assert engine.triton_mode1_gdiff_direct_final is True
+    assert engine.mode1_gdiff_schedule == "grouped"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

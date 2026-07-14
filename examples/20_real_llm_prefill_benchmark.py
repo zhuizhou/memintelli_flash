@@ -1416,6 +1416,8 @@ def make_engine(args, device):
             triton_mode1_gidx_direct_final=args.triton_mode1_gidx_direct_final,
             triton_mode1_input_tile_group=args.triton_mode1_input_tile_group,
             triton_mode1_chunked_direct_final=args.triton_mode1_chunked_direct_final,
+            triton_mode1_gdiff_direct_final=args.triton_mode1_gdiff_direct_final,
+            mode1_gdiff_schedule=args.mode1_gdiff_schedule,
             triton_mode2_diff_direct_final=args.triton_mode2_diff_direct_final,
             triton_mode2_diff_presubtract=args.triton_mode2_diff_presubtract,
             triton_mode2_diff_fuse_input_slices=args.triton_mode2_diff_fuse_input_slices,
@@ -1824,6 +1826,11 @@ def build_output_blocked_linear(LinearMem, args, engine, child, supports_skip, p
                 terminal_layer=terminal_layer,
             )
         )
+        if int(getattr(args, "mode", 0)) == 1:
+            block.weight_sliced.mode1_execution_window_cols = min(
+                int(end - start),
+                int(getattr(plan, "execution_window_cols", end - start) or (end - start)),
+            )
         blocks.append(block)
         block_ranges.append((start, end))
     wrapped = GenericOutputBlockedLinearMem(
@@ -2577,6 +2584,14 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                         LinearMem, args, engine, child, build_device, supports_skip, terminal_layer=is_head
                     ))
                     object.__setattr__(new_layer, "output_block_plan", output_block_plan)
+                    if int(getattr(args, "mode", 0)) == 1:
+                        new_layer.weight_sliced.mode1_execution_window_cols = min(
+                            int(child.out_features),
+                            int(
+                                getattr(output_block_plan, "execution_window_cols", child.out_features)
+                                or child.out_features
+                            ),
+                        )
                 if is_head or output_block_plan.shard_count > 1:
                     state["output_block_plans"].append(
                         {
@@ -2592,6 +2607,12 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                             "safety_margin_mb": float(output_block_plan.safety_margin_mb),
                             "preparation_peak_mb": float(output_block_plan.preparation_peak_mb),
                             "execution_peak_mb": float(output_block_plan.execution_peak_mb),
+                            "execution_window_cols": int(
+                                getattr(output_block_plan, "execution_window_cols", output_block_plan.output_block_cols)
+                            ),
+                            "execution_window_bytes": int(
+                                getattr(output_block_plan, "execution_window_bytes", 0)
+                            ),
                             "predicted_prepare_peak_mb": float(
                                 output_block_plan.preparation_peak_mb
                                 + output_block_plan.base_allocated_mb
@@ -2732,6 +2753,8 @@ def apply_worker_s2_stage(args):
         raise ValueError(f"unsupported S2 stage: {stage}")
     fast_inference = stage != "off"
     args.fast_inference = fast_inference
+    args.triton_mode1_gidx_direct_final = fast_inference
+    args.triton_mode1_gdiff_direct_final = fast_inference
     args.triton_fuse_restored_input_slices = fast_inference
     args.triton_direct_final_output = fast_inference
     if not fast_inference or not bool(getattr(args, "_triton_gidx_direct_final_output_user_set", False)):
@@ -3549,6 +3572,8 @@ def main():
     parser.add_argument("--triton-mode1-gidx-direct-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--triton-mode1-input-tile-group", type=int, default=1)
     parser.add_argument("--triton-mode1-chunked-direct-final", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--triton-mode1-gdiff-direct-final", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mode1-gdiff-schedule", choices=["auto", "owner", "grouped"], default="auto")
     parser.add_argument("--triton-mode2-diff-direct-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--triton-mode2-diff-presubtract", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--triton-mode2-diff-fuse-input-slices", action=argparse.BooleanOptionalAction, default=True)
@@ -4397,6 +4422,8 @@ def main():
         "triton_mode1_gidx_direct_final": bool(args.triton_mode1_gidx_direct_final) if args.kind == "v3" else False,
         "triton_mode1_input_tile_group": int(args.triton_mode1_input_tile_group) if args.kind == "v3" else 1,
         "triton_mode1_chunked_direct_final": bool(args.triton_mode1_chunked_direct_final) if args.kind == "v3" else False,
+        "triton_mode1_gdiff_direct_final": bool(args.triton_mode1_gdiff_direct_final) if args.kind == "v3" else False,
+        "mode1_gdiff_schedule": str(args.mode1_gdiff_schedule) if args.kind == "v3" else "off",
         "triton_mode2_diff_direct_final": bool(args.triton_mode2_diff_direct_final) if args.kind == "v3" else False,
         "triton_mode2_diff_presubtract": bool(args.triton_mode2_diff_presubtract) if args.kind == "v3" else False,
         "triton_mode2_diff_fuse_input_slices": bool(args.triton_mode2_diff_fuse_input_slices) if args.kind == "v3" else False,
@@ -5108,6 +5135,9 @@ def apply_s2_stage(args):
     args.s2_ablation_stage = stage
 
     fast_inference = stage != "off"
+    args.fast_inference = fast_inference
+    args.triton_mode1_gidx_direct_final = fast_inference
+    args.triton_mode1_gdiff_direct_final = fast_inference
     args.triton_fuse_restored_input_slices = fast_inference
     args.triton_direct_final_output = fast_inference
     if not fast_inference or not bool(getattr(args, "_triton_gidx_direct_final_output_user_set", False)):
@@ -5351,6 +5381,8 @@ def failure_row(
         "triton_mode1_gidx_direct_final": bool(args.triton_mode1_gidx_direct_final) if kind == "v3" else False,
         "triton_mode1_input_tile_group": int(args.triton_mode1_input_tile_group) if kind == "v3" else 1,
         "triton_mode1_chunked_direct_final": bool(args.triton_mode1_chunked_direct_final) if kind == "v3" else False,
+        "triton_mode1_gdiff_direct_final": bool(args.triton_mode1_gdiff_direct_final) if kind == "v3" else False,
+        "mode1_gdiff_schedule": str(args.mode1_gdiff_schedule) if kind == "v3" else "off",
         "triton_mode2_diff_direct_final": bool(args.triton_mode2_diff_direct_final) if kind == "v3" else False,
         "triton_mode2_diff_presubtract": bool(args.triton_mode2_diff_presubtract) if kind == "v3" else False,
         "triton_mode2_diff_fuse_input_slices": bool(args.triton_mode2_diff_fuse_input_slices) if kind == "v3" else False,
@@ -5611,6 +5643,8 @@ def run_worker(args, repo: Path | None, label: str, kind: str, extra: list[str])
     cmd.append("--triton-mode1-gidx-direct-final" if args.triton_mode1_gidx_direct_final else "--no-triton-mode1-gidx-direct-final")
     cmd.extend(["--triton-mode1-input-tile-group", str(args.triton_mode1_input_tile_group)])
     cmd.append("--triton-mode1-chunked-direct-final" if args.triton_mode1_chunked_direct_final else "--no-triton-mode1-chunked-direct-final")
+    cmd.append("--triton-mode1-gdiff-direct-final" if args.triton_mode1_gdiff_direct_final else "--no-triton-mode1-gdiff-direct-final")
+    cmd.extend(["--mode1-gdiff-schedule", str(args.mode1_gdiff_schedule)])
     cmd.append("--triton-mode2-diff-direct-final" if args.triton_mode2_diff_direct_final else "--no-triton-mode2-diff-direct-final")
     cmd.append("--triton-mode2-diff-presubtract" if args.triton_mode2_diff_presubtract else "--no-triton-mode2-diff-presubtract")
     cmd.append("--triton-mode2-diff-fuse-input-slices" if args.triton_mode2_diff_fuse_input_slices else "--no-triton-mode2-diff-fuse-input-slices")
@@ -6162,6 +6196,8 @@ def parse_args():
     parser.add_argument("--triton-mode1-gidx-direct-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--triton-mode1-input-tile-group", type=int, default=1)
     parser.add_argument("--triton-mode1-chunked-direct-final", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--triton-mode1-gdiff-direct-final", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mode1-gdiff-schedule", choices=["auto", "owner", "grouped"], default="auto")
     parser.add_argument("--triton-mode2-diff-direct-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--triton-mode2-diff-presubtract", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--triton-mode2-diff-fuse-input-slices", action=argparse.BooleanOptionalAction, default=True)

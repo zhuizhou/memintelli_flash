@@ -6814,6 +6814,121 @@ if triton is not None:
 
 
     @triton.jit
+    def _mode1_gdiff_direct_final_grouped_kernel(
+        vin,
+        gdiff,
+        w_scale,
+        x_max,
+        out,
+        vin_s0: tl.constexpr,
+        vin_s1: tl.constexpr,
+        gd_s0: tl.constexpr,
+        gd_s1: tl.constexpr,
+        ws_s0: tl.constexpr,
+        ws_s1: tl.constexpr,
+        out_s0: tl.constexpr,
+        out_s1: tl.constexpr,
+        R: tl.constexpr,
+        C: tl.constexpr,
+        O: tl.constexpr,
+        TILE_IN: tl.constexpr,
+        TILE_OUT: tl.constexpr,
+        OUT_TILE_COUNT: tl.constexpr,
+        ADC_REF_UNIT: tl.constexpr,
+        RADC_SCALE: tl.constexpr,
+        C2W_DENOM: tl.constexpr,
+        INPUT_PRECISION: tl.constexpr,
+        DOT_DTYPE: tl.constexpr,
+        USE_ATOMIC: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_L: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        NUM_R_BLOCKS: tl.constexpr,
+        NUM_L_BLOCKS: tl.constexpr,
+        NUM_IN_TILES: tl.constexpr,
+        NUM_IN_TILE_GROUPS: tl.constexpr,
+        GROUP_IN_TILES: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pid_r = pid % NUM_R_BLOCKS
+        pid_rest = pid // NUM_R_BLOCKS
+        pid_ig = pid_rest % NUM_IN_TILE_GROUPS
+        pid_ol = pid_rest // NUM_IN_TILE_GROUPS
+        pid_ot = pid_ol // NUM_L_BLOCKS
+        pid_l = pid_ol - pid_ot * NUM_L_BLOCKS
+
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        out_cols = pid_ot * TILE_OUT + offs_l
+        offs_k = tl.arange(0, BLOCK_K)
+        mask_r = offs_r < R
+        mask_l = out_cols < O
+        safe_xmax = tl.maximum(tl.load(x_max).to(tl.float32), 1.1754943508222875e-38)
+        tile_total = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+
+        base_it = pid_ig * GROUP_IN_TILES
+        for gi in tl.static_range(0, GROUP_IN_TILES):
+            pid_it = base_it + gi
+            valid_it = pid_it < NUM_IN_TILES
+            r0 = pid_it * TILE_IN
+            tile_width = tl.minimum(TILE_IN, C - r0)
+            tile_width = tl.where(valid_it & (tile_width > 0), tile_width, 0)
+            adc_ref_tile = ADC_REF_UNIT * tile_width
+            safe_adc_ref = tl.where(adc_ref_tile > 0.0, adc_ref_tile, 1.0)
+            current = tl.zeros((BLOCK_R, BLOCK_L), dtype=tl.float32)
+
+            for k0 in tl.static_range(0, TILE_IN, BLOCK_K):
+                k_rel = k0 + offs_k
+                k_abs = r0 + k_rel
+                mask_k = valid_it & (k_rel < TILE_IN) & (k_abs < C)
+                voltage = tl.load(
+                    vin + offs_r[:, None] * vin_s0 + k_abs[None, :] * vin_s1,
+                    mask=mask_r[:, None] & mask_k[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                conductance = tl.load(
+                    gdiff + k_abs[:, None] * gd_s0 + out_cols[None, :] * gd_s1,
+                    mask=mask_k[:, None] & mask_l[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if DOT_DTYPE == 1:
+                    voltage = voltage.to(tl.float16)
+                    conductance = conductance.to(tl.float16)
+                elif DOT_DTYPE == 2:
+                    voltage = voltage.to(tl.bfloat16)
+                    conductance = conductance.to(tl.bfloat16)
+                current += tl.dot(
+                    voltage,
+                    conductance,
+                    input_precision=INPUT_PRECISION,
+                )
+
+            quantized = _round_even(current / safe_adc_ref * RADC_SCALE) / RADC_SCALE
+            scale_value = tl.load(
+                w_scale + pid_it * ws_s0 + pid_ot * ws_s1,
+                mask=valid_it & (pid_ot < OUT_TILE_COUNT),
+                other=0.0,
+            ).to(tl.float32)
+            tile_total += quantized * (
+                adc_ref_tile * scale_value * (safe_xmax / C2W_DENOM)
+            )
+
+        if USE_ATOMIC:
+            tl.atomic_add(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                tile_total,
+                mask=mask_r[:, None] & mask_l[None, :],
+                sem="relaxed",
+            )
+        else:
+            tl.store(
+                out + offs_r[:, None] * out_s0 + out_cols[None, :] * out_s1,
+                tile_total,
+                mask=mask_r[:, None] & mask_l[None, :],
+            )
+
+
+    @triton.jit
     def _mode1_gidx_direct_final_kernel(
         x,
         gp_idx,
@@ -7301,6 +7416,7 @@ def triton_restore_mode2_gdiff_gidx_read_noise(
     q_g: float,
     read_sigma: float,
     dtype: torch.dtype,
+    out: torch.Tensor | None = None,
     noise_seed: int = 12345,
     noise_offset_base: int = 0,
     block: int = 256,
@@ -7314,7 +7430,15 @@ def triton_restore_mode2_gdiff_gidx_read_noise(
         raise ValueError(f"Mode-2 Gdiff restore shape mismatch: gp={tuple(gp_idx.shape)}, gn={tuple(gn_idx.shape)}")
     gp_c = gp_idx.contiguous()
     gn_c = gn_idx.contiguous()
-    out = torch.empty(gp_c.shape, device=gp_c.device, dtype=dtype)
+    if out is None:
+        out = torch.empty(gp_c.shape, device=gp_c.device, dtype=dtype)
+    else:
+        if out.shape != gp_c.shape:
+            raise ValueError(
+                f"Mode-2 Gdiff output shape mismatch: expected {tuple(gp_c.shape)}, got {tuple(out.shape)}"
+            )
+        if out.device != gp_c.device or out.dtype != dtype or not out.is_contiguous():
+            raise ValueError("Mode-2 Gdiff output workspace must be contiguous and match device/dtype.")
     total = gp_c.numel()
     grid = (triton.cdiv(total, block),)
     _restore_mode2_gdiff_gidx_read_noise_kernel[grid](
@@ -7342,6 +7466,7 @@ def triton_restore_mode1_gdiff_gidx_read_noise(
     q_g: float,
     read_sigma: float,
     dtype: torch.dtype,
+    out: torch.Tensor | None = None,
     noise_seed: int = 12345,
     noise_offset_base: int = 0,
     block: int = 256,
@@ -7354,6 +7479,7 @@ def triton_restore_mode1_gdiff_gidx_read_noise(
         q_g=q_g,
         read_sigma=read_sigma,
         dtype=dtype,
+        out=out,
         noise_seed=noise_seed,
         noise_offset_base=noise_offset_base,
         block=block,
@@ -8508,6 +8634,114 @@ def triton_mode1_precompute_signed_voltage(
         float(rdac - 1),
         float(vread / (rdac - 1)),
         int(block),
+        num_warps=4,
+    )
+    return out
+
+
+def triton_mode1_gdiff_direct_final(
+    vin: torch.Tensor,
+    gdiff: torch.Tensor,
+    w_scale: torch.Tensor,
+    *,
+    x_max: float | torch.Tensor,
+    adc_ref_unit: float,
+    radc: int,
+    vread: float,
+    q_g: float,
+    g_level: int,
+    tile_in: int,
+    tile_out: int,
+    input_precision: str = "ieee",
+    dot_dtype_override: int | None = None,
+    block_r: int = 32,
+    block_l: int = 16,
+    block_k: int = 64,
+    input_tile_group: int = 1,
+) -> torch.Tensor:
+    if triton is None:
+        raise RuntimeError(f"Triton fast accumulate is unavailable: {TRITON_IMPORT_ERROR}")
+    if not vin.is_cuda or vin.dim() != 2:
+        raise ValueError("Mode-1 Gdiff direct-final expects a 2-D CUDA voltage tensor.")
+    if not gdiff.is_cuda or gdiff.dim() != 2:
+        raise ValueError("Mode-1 Gdiff direct-final expects a 2-D CUDA conductance tensor.")
+    if w_scale.dim() != 2:
+        raise ValueError("Mode-1 Gdiff direct-final expects a 2-D tile scale grid.")
+    if input_precision not in ("tf32", "tf32x3", "ieee"):
+        raise ValueError("input_precision must be 'tf32', 'tf32x3', or 'ieee'.")
+    if radc < 2 or g_level < 2:
+        raise ValueError("radc and g_level must be >= 2.")
+    if tile_in <= 0 or tile_out <= 0 or input_tile_group <= 0:
+        raise ValueError("tile sizes and input_tile_group must be positive.")
+
+    vin0 = vin.contiguous()
+    gd = gdiff.contiguous()
+    ws = w_scale.contiguous()
+    rows, cols = vin0.shape
+    g_rows, out_cols = gd.shape
+    if g_rows != cols:
+        raise ValueError(f"Input/Gdiff shape mismatch: vin={tuple(vin0.shape)}, gdiff={tuple(gd.shape)}")
+    in_tiles = triton.cdiv(cols, tile_in)
+    out_tiles = triton.cdiv(out_cols, tile_out)
+    if tuple(ws.shape) != (in_tiles, out_tiles):
+        raise ValueError(f"w_scale shape mismatch: expected {(in_tiles, out_tiles)}, got {tuple(ws.shape)}")
+    if torch.is_tensor(x_max):
+        xmax = x_max.detach().to(device=vin0.device, dtype=torch.float32).reshape(()).contiguous()
+    else:
+        xmax = torch.tensor(float(x_max), device=vin0.device, dtype=torch.float32)
+    default_dot_dtype = (
+        2
+        if vin0.dtype is torch.bfloat16 and gd.dtype is torch.bfloat16
+        else 1
+        if vin0.dtype is torch.float16 and gd.dtype is torch.float16
+        else 0
+    )
+    dot_dtype = _resolve_dot_dtype(default_dot_dtype, dot_dtype_override)
+    group_tiles = max(1, min(int(input_tile_group), int(in_tiles)))
+    in_tile_groups = triton.cdiv(in_tiles, group_tiles)
+    use_atomic = in_tile_groups > 1
+    out = (
+        torch.zeros((rows, out_cols), device=vin0.device, dtype=torch.float32)
+        if use_atomic
+        else torch.empty((rows, out_cols), device=vin0.device, dtype=torch.float32)
+    )
+    num_r_blocks = triton.cdiv(rows, block_r)
+    num_l_blocks = triton.cdiv(tile_out, block_l)
+    grid = (num_r_blocks * in_tile_groups * out_tiles * num_l_blocks,)
+    _mode1_gdiff_direct_final_grouped_kernel[grid](
+        vin0,
+        gd,
+        ws,
+        xmax,
+        out,
+        vin0.stride(0),
+        vin0.stride(1),
+        gd.stride(0),
+        gd.stride(1),
+        ws.stride(0),
+        ws.stride(1),
+        out.stride(0),
+        out.stride(1),
+        rows,
+        cols,
+        out_cols,
+        int(tile_in),
+        int(tile_out),
+        out_tiles,
+        float(adc_ref_unit),
+        float(radc - 1),
+        float(float(vread) * float(q_g) * float(g_level - 1)),
+        input_precision,
+        dot_dtype,
+        bool(use_atomic),
+        int(block_r),
+        int(block_l),
+        int(block_k),
+        num_r_blocks,
+        num_l_blocks,
+        in_tiles,
+        in_tile_groups,
+        group_tiles,
         num_warps=4,
     )
     return out

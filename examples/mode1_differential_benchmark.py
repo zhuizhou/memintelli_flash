@@ -29,6 +29,8 @@ def build_mode1_engine(
     dtype: torch.dtype,
     require_fastpath: bool,
     input_tile_group: int = 1,
+    gdiff_direct: bool = False,
+    gdiff_schedule: str = "auto",
 ) -> DPETensorMultiMode:
     return DPETensorMultiMode(
         HGS=1e-5,
@@ -49,6 +51,8 @@ def build_mode1_engine(
         triton_input_precision="ieee",
         triton_auto_config=True,
         triton_mode1_gidx_direct_final=True,
+        triton_mode1_gdiff_direct_final=bool(gdiff_direct),
+        mode1_gdiff_schedule=str(gdiff_schedule),
         triton_mode1_chunked_direct_final=True,
         triton_mode1_input_tile_group=int(input_tile_group),
         mode1_grouped_tile_gemm=False,
@@ -196,13 +200,18 @@ def parse_shape(value: str) -> tuple[int, int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mode1 differential-pair microbenchmark")
     parser.add_argument("--shape", type=parse_shape, default=NAMED_SHAPES["qkv"])
-    parser.add_argument("--path", choices=["reference", "pair-direct", "both"], default="both")
+    parser.add_argument(
+        "--path",
+        choices=["reference", "pair-direct", "gdiff-direct", "both", "all"],
+        default="both",
+    )
     parser.add_argument("--read-var", type=float, default=0.0)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--input-tile-group", type=int, default=1)
+    parser.add_argument("--gdiff-schedule", choices=["auto", "owner", "grouped"], default="auto")
     parser.add_argument("--json-out")
     args = parser.parse_args()
 
@@ -232,7 +241,7 @@ def main() -> None:
         "repeat": int(args.repeat),
         "paths": {},
     }
-    if args.path in ("reference", "both"):
+    if args.path in ("reference", "both", "all"):
         reference = build_mode1_engine(
             device,
             backend="torch",
@@ -248,7 +257,7 @@ def main() -> None:
             warmup=args.warmup,
             repeat=args.repeat,
         )
-    if args.path in ("pair-direct", "both"):
+    if args.path in ("pair-direct", "both", "all"):
         optimized = build_mode1_engine(
             device,
             backend="triton_gidx",
@@ -264,10 +273,33 @@ def main() -> None:
             warmup=args.warmup,
             repeat=args.repeat,
         )
+    if args.path in ("gdiff-direct", "all"):
+        optimized = build_mode1_engine(
+            device,
+            backend="triton_gidx",
+            read_var=args.read_var,
+            dtype=dtype,
+            require_fastpath=True,
+            input_tile_group=args.input_tile_group,
+            gdiff_direct=True,
+            gdiff_schedule=args.gdiff_schedule,
+        )
+        result["paths"]["gdiff_direct"] = benchmark_path(
+            optimized,
+            x_sliced,
+            weight_sliced,
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
     if "reference" in result["paths"] and "pair_direct" in result["paths"]:
         result["speedup"] = (
             result["paths"]["reference"]["mean_ms"]
             / result["paths"]["pair_direct"]["mean_ms"]
+        )
+    if "pair_direct" in result["paths"] and "gdiff_direct" in result["paths"]:
+        result["gdiff_speedup_vs_pair"] = (
+            result["paths"]["pair_direct"]["mean_ms"]
+            / result["paths"]["gdiff_direct"]["mean_ms"]
         )
 
     payload = json.dumps(result, indent=2)

@@ -125,6 +125,8 @@ class DPETensorMultiMode(object):
         triton_mode1_gidx_direct_final=True,
         triton_mode1_input_tile_group=1,
         triton_mode1_chunked_direct_final=True,
+        triton_mode1_gdiff_direct_final=False,
+        mode1_gdiff_schedule="auto",
         mode1_require_fastpath=False,
         triton_mode2_diff_direct_final=True,
         triton_mode2_diff_gidx_from_slices=False,
@@ -479,6 +481,10 @@ class DPETensorMultiMode(object):
         self.triton_mode1_gidx_direct_final = bool(triton_mode1_gidx_direct_final)
         self.triton_mode1_input_tile_group = max(1, int(triton_mode1_input_tile_group))
         self.triton_mode1_chunked_direct_final = bool(triton_mode1_chunked_direct_final)
+        self.triton_mode1_gdiff_direct_final = bool(triton_mode1_gdiff_direct_final)
+        self.mode1_gdiff_schedule = str(mode1_gdiff_schedule or "auto").lower()
+        if self.mode1_gdiff_schedule not in {"auto", "owner", "grouped"}:
+            raise ValueError("mode1_gdiff_schedule must be 'auto', 'owner', or 'grouped'.")
         self.mode1_require_fastpath = bool(mode1_require_fastpath)
         self.triton_mode2_diff_direct_final = bool(triton_mode2_diff_direct_final)
         self.triton_mode2_diff_gidx_from_slices = bool(triton_mode2_diff_gidx_from_slices)
@@ -506,6 +512,7 @@ class DPETensorMultiMode(object):
         self._read_noise_forward_offset_counter = 0
         self._read_noise_generators = {}
         self._mode0_restore_prefetch = {}
+        self._mode1_gdiff_workspace = None
         self.device = device
 
         if self.radc_is_list:
@@ -728,6 +735,17 @@ class DPETensorMultiMode(object):
             "mode1_gidx_direct_final_grouped_success_count": 0,
             "mode1_precomputed_v_success_count": 0,
             "mode1_precomputed_v_fallback_count": 0,
+            "mode1_gdiff_restore_attempt_count": 0,
+            "mode1_gdiff_restore_success_count": 0,
+            "mode1_gdiff_restore_fallback_count": 0,
+            "mode1_gdiff_direct_final_attempt_count": 0,
+            "mode1_gdiff_direct_final_success_count": 0,
+            "mode1_gdiff_direct_final_fallback_count": 0,
+            "mode1_gdiff_owner_success_count": 0,
+            "mode1_gdiff_grouped_success_count": 0,
+            "mode1_gdiff_workspace_alloc_count": 0,
+            "mode1_gdiff_workspace_reuse_count": 0,
+            "mode1_gdiff_workspace_peak_bytes": 0,
             "mode1_chunked_direct_final_attempt_count": 0,
             "mode1_chunked_direct_final_success_count": 0,
             "mode1_chunked_direct_final_fallback_count": 0,
@@ -5016,6 +5034,265 @@ class DPETensorMultiMode(object):
         )
         return out
 
+    def _mode1_gdiff_input_tile_group(self, in_features, tile_in):
+        input_tiles = max(1, (int(in_features) + int(tile_in) - 1) // int(tile_in))
+        schedule = str(getattr(self, "mode1_gdiff_schedule", "auto") or "auto")
+        if schedule == "owner" or (schedule == "auto" and input_tiles <= 64):
+            return input_tiles, "owner"
+        configured = max(1, int(getattr(self, "triton_mode1_input_tile_group", 1) or 1))
+        group = configured if configured > 1 else 4
+        return min(input_tiles, group), "grouped"
+
+    def _mode1_gdiff_execution_window_cols(self, mat, tile_out, out_features):
+        requested = int(getattr(mat, "mode1_execution_window_cols", 0) or 0)
+        if requested <= 0:
+            return int(out_features)
+        aligned = max(int(tile_out), (requested // int(tile_out)) * int(tile_out))
+        return min(int(out_features), aligned)
+
+    def _mode1_gdiff_workspace_view(self, shape, dtype, device):
+        required = 1
+        for dim in shape:
+            required *= int(dim)
+        workspace = getattr(self, "_mode1_gdiff_workspace", None)
+        can_reuse = (
+            workspace is not None
+            and workspace.device == device
+            and workspace.dtype == dtype
+            and int(workspace.numel()) >= required
+        )
+        if not can_reuse:
+            capacity = 1 << (max(1, required) - 1).bit_length()
+            self._mode1_gdiff_workspace = torch.empty(capacity, device=device, dtype=dtype)
+            workspace = self._mode1_gdiff_workspace
+            self._fastpath_count("mode1_gdiff_workspace_alloc_count")
+        else:
+            self._fastpath_count("mode1_gdiff_workspace_reuse_count")
+        self.fastpath_counters["mode1_gdiff_workspace_peak_bytes"] = max(
+            int(self.fastpath_counters.get("mode1_gdiff_workspace_peak_bytes", 0)),
+            int(workspace.numel()) * int(workspace.element_size()),
+        )
+        return workspace[:required].view(tuple(int(dim) for dim in shape))
+
+    def _triton_mode1_gdiff_direct_final_output(
+        self,
+        x_2d,
+        mat,
+        scale_grid,
+        x_max,
+        tile_in,
+        tile_out,
+        *,
+        c0=None,
+        c1=None,
+        precomputed_v=None,
+    ):
+        if not (
+            bool(getattr(self, "triton_mode1_gdiff_direct_final", False))
+            and self.fast_inference_backend in ("triton", "triton_gidx")
+            and self.mode == 1
+            and not self.radc_is_list
+            and self.vnoise == 0
+            and self.mode1_adc_per_tile
+            and x_2d.dim() == 2
+            and x_2d.is_cuda
+            and precomputed_v is not None
+            and getattr(mat, "G_is_compressed", False)
+            and isinstance(getattr(mat, "G_indices", None), tuple)
+            and self._rv_all_same
+            and self._has_read_noise
+            and self._rv_sigma > 0
+            and not self._write_variation_is_virtual()
+        ):
+            return None
+
+        gp_idx, gn_idx = mat.G_indices
+        if gp_idx.dim() != 2 or gn_idx.dim() != 2 or gp_idx.shape != gn_idx.shape:
+            return None
+        full_out_features = int(mat.shape[1])
+        if int(gp_idx.shape[0]) != int(x_2d.shape[-1]) or int(gp_idx.shape[1]) != full_out_features:
+            return None
+        if c0 is None or c1 is None:
+            window_cols = self._mode1_gdiff_execution_window_cols(mat, tile_out, full_out_features)
+            if window_cols < full_out_features:
+                return None
+            out_start, out_end = 0, full_out_features
+            scale_chunk = scale_grid
+        else:
+            out_start, out_end = self._direct_output_col_range_2d(mat, c0, c1)
+            if out_start >= out_end:
+                return None
+            scale_chunk = scale_grid[:, int(c0):int(c1)]
+            if scale_chunk.numel() == 0:
+                return None
+
+        plan = self._mode1_triton_plan(
+            x_2d,
+            mat,
+            tile_in,
+            tile_out,
+            out_cols=int(out_end - out_start),
+        )
+        input_tile_group, schedule = self._mode1_gdiff_input_tile_group(
+            x_2d.shape[1],
+            tile_in,
+        )
+        try:
+            from .triton_fast_accumulate import (
+                triton_mode1_gdiff_direct_final,
+                triton_restore_mode1_gdiff_gidx_read_noise,
+            )
+        except Exception as exc:
+            self._fastpath_count("mode1_gdiff_restore_fallback_count")
+            self._fastpath_count("mode1_gdiff_direct_final_fallback_count")
+            if self.profile:
+                self.profile_events.append({
+                    "label": "triton_mode1_gdiff_direct_final_import",
+                    "ms": 0.0,
+                    "reason": type(exc).__name__,
+                })
+            return None
+
+        gp_chunk = gp_idx[:, out_start:out_end]
+        gn_chunk = gn_idx[:, out_start:out_end]
+        noise_offset_base = int(self._read_noise_forward_offset_counter)
+        self._read_noise_forward_offset_counter += int(gp_chunk.numel()) * 2
+        self._fastpath_count("mode1_gdiff_restore_attempt_count")
+        restore_token = self._profile_start("triton_mode1_gdiff_restore")
+        try:
+            workspace = self._mode1_gdiff_workspace_view(
+                gp_chunk.shape,
+                self.compute_dtype,
+                gp_chunk.device,
+            )
+            gdiff = triton_restore_mode1_gdiff_gidx_read_noise(
+                gp_chunk,
+                gn_chunk,
+                lgs=self.LGS,
+                q_g=self.Q_G,
+                read_sigma=float(self._rv_sigma),
+                dtype=self.compute_dtype,
+                out=workspace,
+                noise_seed=self._read_noise_seed_base,
+                noise_offset_base=noise_offset_base,
+                block=max(128, int(getattr(self, "triton_gidx_restore_block", 512) or 512)),
+            )
+        except Exception as exc:
+            self._fastpath_count("mode1_gdiff_restore_fallback_count")
+            self._profile_stop(
+                restore_token,
+                backend="triton_mode1_gdiff_restore",
+                status="fallback",
+                reason=type(exc).__name__,
+                message=str(exc),
+            )
+            return None
+        self._fastpath_count("mode1_gdiff_restore_success_count")
+        self._profile_stop(
+            restore_token,
+            backend="triton_mode1_gdiff_restore",
+            status="ok",
+            shape_key=f"in={int(gp_chunk.shape[0])};out={int(gp_chunk.shape[1])}",
+        )
+
+        self._fastpath_count("mode1_gdiff_direct_final_attempt_count")
+        direct_token = self._profile_start("triton_mode1_gdiff_direct_final")
+        try:
+            out = triton_mode1_gdiff_direct_final(
+                precomputed_v,
+                gdiff,
+                scale_chunk,
+                x_max=x_max,
+                adc_ref_unit=(self.HGS - self.LGS) * self.vread,
+                radc=int(self.radc),
+                vread=self.vread,
+                q_g=self.Q_G,
+                g_level=int(self.g_level),
+                tile_in=int(tile_in),
+                tile_out=int(tile_out),
+                input_precision=self.triton_input_precision,
+                dot_dtype_override=self._triton_dot_dtype_override(),
+                block_r=int(plan["block_r"]),
+                block_l=int(plan["block_l"]),
+                block_k=int(plan["block_k"]),
+                input_tile_group=int(input_tile_group),
+            )
+        except Exception as exc:
+            self._fastpath_count("mode1_gdiff_direct_final_fallback_count")
+            self._profile_stop(
+                direct_token,
+                backend="triton_mode1_gdiff_direct_final",
+                status="fallback",
+                reason=type(exc).__name__,
+                message=str(exc),
+            )
+            del gdiff
+            return None
+        del gdiff
+        self._fastpath_count("mode1_gdiff_direct_final_success_count")
+        self._fastpath_count(
+            "mode1_gdiff_owner_success_count"
+            if schedule == "owner"
+            else "mode1_gdiff_grouped_success_count"
+        )
+        self._profile_stop(
+            direct_token,
+            backend="triton_mode1_gdiff_direct_final",
+            status="ok",
+            shape_key=(
+                f"rows={int(x_2d.shape[0])};in={int(x_2d.shape[1])};"
+                f"out={int(out_end - out_start)};tile={int(tile_in)}x{int(tile_out)};"
+                f"schedule={schedule};group={int(input_tile_group)};{plan['shape_key']}"
+            ),
+        )
+        return out
+
+    def _triton_mode1_gdiff_chunked_direct_final_output(
+        self,
+        x_2d,
+        mat,
+        scale_grid,
+        x_max,
+        tile_in,
+        tile_out,
+        precomputed_v=None,
+    ):
+        if not bool(getattr(self, "triton_mode1_gdiff_direct_final", False)):
+            return None
+        out_features = int(mat.shape[1])
+        window_cols = self._mode1_gdiff_execution_window_cols(mat, tile_out, out_features)
+        if window_cols >= out_features:
+            return None
+        ndc_y = int(scale_grid.shape[1])
+        chunk_ndc = max(1, min(ndc_y, window_cols // int(tile_out)))
+        self._fastpath_count("mode1_chunked_direct_final_attempt_count")
+        out = torch.empty(
+            (int(x_2d.shape[0]), out_features),
+            device=x_2d.device,
+            dtype=torch.float32,
+        )
+        for c0 in range(0, ndc_y, chunk_ndc):
+            c1 = min(c0 + chunk_ndc, ndc_y)
+            chunk = self._triton_mode1_gdiff_direct_final_output(
+                x_2d,
+                mat,
+                scale_grid,
+                x_max,
+                tile_in,
+                tile_out,
+                c0=c0,
+                c1=c1,
+                precomputed_v=precomputed_v,
+            )
+            if chunk is None:
+                self._fastpath_count("mode1_chunked_direct_final_fallback_count")
+                return None
+            out_start, out_end = self._direct_output_col_range_2d(mat, c0, c1)
+            out[:, out_start:out_end] = chunk[:, : out_end - out_start]
+            del chunk
+        self._fastpath_count("mode1_chunked_direct_final_success_count")
+        return out
+
     def _triton_mode1_chunked_direct_final_output(
         self,
         x_2d,
@@ -5102,6 +5379,34 @@ class DPETensorMultiMode(object):
             self._fastpath_count("mode1_precomputed_v_fallback_count")
             raise
         self._fastpath_count("mode1_precomputed_v_success_count")
+
+        direct_mode1 = self._triton_mode1_gdiff_direct_final_output(
+            x_2d,
+            mat,
+            scale_grid,
+            x_max,
+            tile_in,
+            tile_out,
+            precomputed_v=V_in,
+        )
+        if direct_mode1 is not None:
+            if has_batch:
+                return direct_mode1.reshape(batch_shape[0], batch_shape[1], out_features)
+            return direct_mode1
+
+        direct_mode1 = self._triton_mode1_gdiff_chunked_direct_final_output(
+            x_2d,
+            mat,
+            scale_grid,
+            x_max,
+            tile_in,
+            tile_out,
+            precomputed_v=V_in,
+        )
+        if direct_mode1 is not None:
+            if has_batch:
+                return direct_mode1.reshape(batch_shape[0], batch_shape[1], out_features)
+            return direct_mode1
 
         direct_mode1 = self._triton_mode1_gidx_direct_final_output(
             x_2d,
