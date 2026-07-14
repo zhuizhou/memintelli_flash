@@ -18,7 +18,7 @@ from memintelli.pimpy import DPETensor
 from memintelli.pimpy.utils import SNR
 
 
-_STREAM_ATTRS = ('G_indices', 'G', 'max_data', 'e_bias', 'mode1_w_max')
+_STREAM_ATTRS = ('G_indices', 'mode1_gdiff_indices', 'G', 'max_data', 'e_bias', 'mode1_w_max')
 
 
 def _input_chunk_max_positions(engine, *, in_features, total_positions):

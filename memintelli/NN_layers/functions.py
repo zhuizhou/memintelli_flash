@@ -67,7 +67,7 @@ class LinearMemRunc(torch.autograd.Function):
             "sliced_data", "sliced_data_p", "sliced_data_n",
             "quantized_data", "quantized_data_p", "quantized_data_n",
             "max_data", "max_data_p", "max_data_n", "e_bias",
-            "G", "G_indices", "mode1_w_max",
+            "G", "G_indices", "mode1_gdiff_indices", "mode1_w_max",
         ):
             setattr(weight_slice, attr, _move_tensor_like(getattr(weight_slice, attr, None), engine.device))
         output = engine.MapReduceDot(input_slice, weight_slice)

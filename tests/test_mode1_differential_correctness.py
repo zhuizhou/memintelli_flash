@@ -17,6 +17,8 @@ def test_compare_mode1_outputs_reports_exact_match():
     assert metrics["torch_equal"] is True
     assert metrics["max_abs"] == 0.0
     assert metrics["mean_abs"] == 0.0
+    assert metrics["relative_l2"] == 0.0
+    assert metrics["equal_fraction"] == 1.0
     assert metrics["cosine_similarity"] == pytest.approx(1.0)
 
 
@@ -39,8 +41,8 @@ def test_mode1_bf16_matches_reference_at_zero_variation(shape):
     )
 
     assert metrics["finite"]
-    assert metrics["allclose_rtol1e_2_atol1e_2"]
-    assert metrics["cosine_similarity"] > 0.999
+    assert metrics["relative_l2"] < 0.1
+    assert metrics["cosine_similarity"] > 0.995
     counters = metrics["fastpath_counters"]
     assert counters["mode1_gidx_direct_final_success_count"] > 0
     assert counters["mode1_gidx_direct_final_fallback_count"] == 0

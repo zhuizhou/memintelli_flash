@@ -123,6 +123,7 @@ class DPETensorMultiMode(object):
         triton_gidx_direct_final_output=True,
         triton_gidx_direct_final_deterministic=False,
         triton_mode1_gidx_direct_final=True,
+        triton_mode1_gdiff_direct_final=True,
         triton_mode1_input_tile_group=1,
         triton_mode1_chunked_direct_final=True,
         mode1_require_fastpath=False,
@@ -315,6 +316,8 @@ class DPETensorMultiMode(object):
                 reduced inside one direct-final Triton program before writing
                 the output. Values >1 reduce final-output atomic writes when
                 the full input dimension spans multiple Mode-1 tiles.
+            triton_mode1_gdiff_direct_final (bool): Store and execute one
+                signed differential conductance index when read variation is zero.
             triton_mode1_chunked_direct_final (bool): Try Mode-1 direct-final
                 on output chunks for very wide layers. The shape-aware plan
                 keeps regular MLP layers whole and chunks lm_head-like layers
@@ -477,6 +480,7 @@ class DPETensorMultiMode(object):
             self.triton_precompute_input_voltage = False
             self.triton_fast_adc_scale = False
         self.triton_mode1_gidx_direct_final = bool(triton_mode1_gidx_direct_final)
+        self.triton_mode1_gdiff_direct_final = bool(triton_mode1_gdiff_direct_final)
         self.triton_mode1_input_tile_group = max(1, int(triton_mode1_input_tile_group))
         self.triton_mode1_chunked_direct_final = bool(triton_mode1_chunked_direct_final)
         self.mode1_require_fastpath = bool(mode1_require_fastpath)
@@ -726,6 +730,9 @@ class DPETensorMultiMode(object):
             "mode1_gidx_direct_final_success_count": 0,
             "mode1_gidx_direct_final_fallback_count": 0,
             "mode1_gidx_direct_final_grouped_success_count": 0,
+            "mode1_gdiff_direct_final_attempt_count": 0,
+            "mode1_gdiff_direct_final_success_count": 0,
+            "mode1_gdiff_direct_final_fallback_count": 0,
             "mode1_gidx_strided_operand_count": 0,
             "mode1_chunked_direct_final_attempt_count": 0,
             "mode1_chunked_direct_final_success_count": 0,
@@ -1681,6 +1688,7 @@ class DPETensorMultiMode(object):
         """
         mat.G = None
         mat.G_indices = None
+        mat.mode1_gdiff_indices = None
         mat.G_index_dtype = None
         mat.G_is_compressed = False
         mat.mode1_w_max = None
@@ -1706,8 +1714,22 @@ class DPETensorMultiMode(object):
                     tile_in,
                     tile_out,
                 )
-                mat.G_indices = (gp_idx, gn_idx)
-                mat.G_index_dtype = gp_idx.dtype
+                use_gdiff = (
+                    bool(getattr(self, "triton_mode1_gdiff_direct_final", False))
+                    and not self._has_read_noise
+                    and not self._write_variation_is_virtual()
+                )
+                if use_gdiff:
+                    gdiff = gp_idx.to(torch.int16) - gn_idx.to(torch.int16)
+                    if self.g_level - 1 <= torch.iinfo(torch.int8).max:
+                        gdiff = gdiff.to(torch.int8)
+                    else:
+                        gdiff = gdiff.to(torch.int16)
+                    mat.mode1_gdiff_indices = gdiff
+                    mat.G_index_dtype = gdiff.dtype
+                else:
+                    mat.G_indices = (gp_idx, gn_idx)
+                    mat.G_index_dtype = gp_idx.dtype
                 mat.G_is_compressed = True
             else:
                 w_max_full = self._expand_mode1_tile_scales(
@@ -2728,6 +2750,25 @@ class DPETensorMultiMode(object):
         out_start = c0 * tile_out
         out_end = min(c1 * tile_out, int(mat.shape[1]))
         if mat.G_is_compressed:
+            gdiff_idx = getattr(mat, "mode1_gdiff_indices", None)
+            if gdiff_idx is not None:
+                signed = gdiff_idx[r0:r1, out_start:out_end].to(torch.int16)
+                gp_idx = torch.clamp(signed, min=0)
+                gn_idx = torch.clamp(-signed, min=0)
+                return (
+                    self._restore_shifted_from_indices(
+                        gp_idx,
+                        seed_write=42,
+                        c0=out_start,
+                        branch=branch_base,
+                    ),
+                    self._restore_shifted_from_indices(
+                        gn_idx,
+                        seed_write=43,
+                        c0=out_start,
+                        branch=branch_base + 1,
+                    ),
+                )
             gp_idx, gn_idx = mat.G_indices
             return (
                 self._restore_shifted_from_indices(
@@ -4871,6 +4912,9 @@ class DPETensorMultiMode(object):
         c0=None,
         c1=None,
     ):
+        gdiff_idx = getattr(mat, "mode1_gdiff_indices", None)
+        pair_indices = getattr(mat, "G_indices", None)
+        use_gdiff = gdiff_idx is not None
         if not (
             bool(getattr(self, "triton_mode1_gidx_direct_final", False))
             and self.fast_inference_backend in ("triton", "triton_gidx")
@@ -4881,15 +4925,22 @@ class DPETensorMultiMode(object):
             and x_2d.dim() == 2
             and x_2d.is_cuda
             and getattr(mat, "G_is_compressed", False)
-            and isinstance(getattr(mat, "G_indices", None), tuple)
+            and (use_gdiff or isinstance(pair_indices, tuple))
             and self._rv_all_same
             and not self._write_variation_is_virtual()
         ):
             return None
-        gp_idx, gn_idx = mat.G_indices
-        if gp_idx.dim() != 2 or gn_idx.dim() != 2 or gp_idx.shape != gn_idx.shape:
+        if use_gdiff:
+            primary_idx = gdiff_idx
+            gp_idx = gn_idx = None
+        else:
+            gp_idx, gn_idx = pair_indices
+            if gp_idx.dim() != 2 or gn_idx.dim() != 2 or gp_idx.shape != gn_idx.shape:
+                return None
+            primary_idx = gp_idx
+        if primary_idx.dim() != 2:
             return None
-        if int(gp_idx.shape[0]) != int(x_2d.shape[-1]) or int(gp_idx.shape[1]) != int(mat.shape[1]):
+        if int(primary_idx.shape[0]) != int(x_2d.shape[-1]) or int(primary_idx.shape[1]) != int(mat.shape[1]):
             return None
         full_out_features = int(mat.shape[1])
         if c0 is None or c1 is None:
@@ -4920,10 +4971,17 @@ class DPETensorMultiMode(object):
             return None
 
         self._fastpath_count("mode1_gidx_direct_final_attempt_count")
+        if use_gdiff:
+            self._fastpath_count("mode1_gdiff_direct_final_attempt_count")
         try:
-            from .triton_fast_accumulate import triton_mode1_gidx_direct_final
+            from .triton_fast_accumulate import (
+                triton_mode1_gdiff_direct_final,
+                triton_mode1_gidx_direct_final,
+            )
         except Exception as exc:
             self._fastpath_count("mode1_gidx_direct_final_fallback_count")
+            if use_gdiff:
+                self._fastpath_count("mode1_gdiff_direct_final_fallback_count")
             if self.profile:
                 self.profile_events.append({
                     "label": "triton_mode1_gidx_direct_final_import",
@@ -4932,21 +4990,30 @@ class DPETensorMultiMode(object):
                 })
             return None
 
-        token = self._profile_start("triton_mode1_gidx_direct_final")
+        backend_name = "triton_mode1_gdiff_direct_final" if use_gdiff else "triton_mode1_gidx_direct_final"
+        token = self._profile_start(backend_name)
         try:
-            gp_chunk = gp_idx[:, out_start:out_end]
-            gn_chunk = gn_idx[:, out_start:out_end]
-            if not gp_chunk.is_contiguous() or not gn_chunk.is_contiguous() or not scale_chunk.is_contiguous():
+            primary_chunk = primary_idx[:, out_start:out_end]
+            gp_chunk = None if use_gdiff else gp_idx[:, out_start:out_end]
+            gn_chunk = None if use_gdiff else gn_idx[:, out_start:out_end]
+            if (
+                not primary_chunk.is_contiguous()
+                or (gn_chunk is not None and not gn_chunk.is_contiguous())
+                or not scale_chunk.is_contiguous()
+            ):
                 self._fastpath_count("mode1_gidx_strided_operand_count")
             noise_offset_base = 0
             if self._has_read_noise and self._rv_sigma > 0:
-                noise_offset_base = self._read_noise_restore_counter * gp_chunk.numel() * 2
+                noise_offset_base = self._read_noise_restore_counter * primary_chunk.numel() * 2
                 self._read_noise_restore_counter += 1
-            out = triton_mode1_gidx_direct_final(
-                x_2d,
-                gp_chunk,
-                gn_chunk,
-                scale_chunk,
+            kernel = triton_mode1_gdiff_direct_final if use_gdiff else triton_mode1_gidx_direct_final
+            kernel_args = (
+                (x_2d, primary_chunk, scale_chunk)
+                if use_gdiff
+                else (x_2d, gp_chunk, gn_chunk, scale_chunk)
+            )
+            out = kernel(
+                *kernel_args,
                 x_max=x_max,
                 lgs=self.LGS,
                 q_g=self.Q_G,
@@ -4969,20 +5036,24 @@ class DPETensorMultiMode(object):
             )
         except Exception as exc:
             self._fastpath_count("mode1_gidx_direct_final_fallback_count")
+            if use_gdiff:
+                self._fastpath_count("mode1_gdiff_direct_final_fallback_count")
             self._profile_stop(
                 token,
-                backend="triton_mode1_gidx_direct_final",
+                backend=backend_name,
                 status="fallback",
                 reason=type(exc).__name__,
                 message=str(exc),
             )
             return None
         self._fastpath_count("mode1_gidx_direct_final_success_count")
+        if use_gdiff:
+            self._fastpath_count("mode1_gdiff_direct_final_success_count")
         if int(plan["input_tile_group"]) > 1:
             self._fastpath_count("mode1_gidx_direct_final_grouped_success_count")
         self._profile_stop(
             token,
-            backend="triton_mode1_gidx_direct_final",
+            backend=backend_name,
             status="ok",
             shape_key=(
                 f"rows={int(x_2d.shape[0])};in={int(x_2d.shape[1])};"

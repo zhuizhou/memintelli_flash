@@ -49,6 +49,7 @@ class SlicedDataMultiMode(object):
 
         self.G = None
         self.G_indices = None
+        self.mode1_gdiff_indices = None
         self.G_index_dtype = None
         self.G_is_compressed = False
         self.paral_size = paral_size
@@ -178,6 +179,8 @@ class SlicedDataMultiMode(object):
                 if self.mode1_w_max.dim() >= 2
                 else self.mode1_w_max.clone()
             )
+        if self.mode1_gdiff_indices is not None:
+            c.mode1_gdiff_indices = self.mode1_gdiff_indices.transpose(-2, -1)
 
         if self.is_weight and self.G is not None:
             if isinstance(self.G, tuple):

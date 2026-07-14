@@ -6839,6 +6839,7 @@ if triton is not None:
         INPUT_PRECISION: tl.constexpr,
         DOT_DTYPE: tl.constexpr,
         USE_READ_NOISE: tl.constexpr,
+        USE_GDIFF: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_L: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -6882,23 +6883,26 @@ if triton is not None:
                 mask=mask_k[:, None] & mask_l[None, :],
                 other=0.0,
             ).to(tl.float32)
-            gn = tl.load(
-                gn_idx + k_abs[:, None] * gn_s0 + out_cols[None, :] * gn_s1,
-                mask=mask_k[:, None] & mask_l[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            if USE_READ_NOISE:
-                noise_base_p = NOISE_OFFSET_BASE + 2 * (
-                    k_abs[:, None] * O + out_cols[None, :]
-                )
-                noise_base_n = noise_base_p + 1
-                gp_abs = LGS + gp * Q_G
-                gn_abs = LGS + gn * Q_G
-                gp_shift = gp_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_p) * READ_SIGMA) - LGS
-                gn_shift = gn_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_n) * READ_SIGMA) - LGS
-                w = gp_shift - gn_shift
+            if USE_GDIFF:
+                w = gp * Q_G
             else:
-                w = (gp - gn) * Q_G
+                gn = tl.load(
+                    gn_idx + k_abs[:, None] * gn_s0 + out_cols[None, :] * gn_s1,
+                    mask=mask_k[:, None] & mask_l[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if USE_READ_NOISE:
+                    noise_base_p = NOISE_OFFSET_BASE + 2 * (
+                        k_abs[:, None] * O + out_cols[None, :]
+                    )
+                    noise_base_n = noise_base_p + 1
+                    gp_abs = LGS + gp * Q_G
+                    gn_abs = LGS + gn * Q_G
+                    gp_shift = gp_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_p) * READ_SIGMA) - LGS
+                    gn_shift = gn_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_n) * READ_SIGMA) - LGS
+                    w = gp_shift - gn_shift
+                else:
+                    w = (gp - gn) * Q_G
             if DOT_DTYPE == 1:
                 v = v.to(tl.float32).to(tl.float16)
                 w = w.to(tl.float32).to(tl.float16)
@@ -6960,6 +6964,7 @@ if triton is not None:
         INPUT_PRECISION: tl.constexpr,
         DOT_DTYPE: tl.constexpr,
         USE_READ_NOISE: tl.constexpr,
+        USE_GDIFF: tl.constexpr,
         USE_ATOMIC: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_L: tl.constexpr,
@@ -7015,23 +7020,26 @@ if triton is not None:
                     mask=mask_k[:, None] & mask_l[None, :],
                     other=0.0,
                 ).to(tl.float32)
-                gn = tl.load(
-                    gn_idx + k_abs[:, None] * gn_s0 + out_cols[None, :] * gn_s1,
-                    mask=mask_k[:, None] & mask_l[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                if USE_READ_NOISE:
-                    noise_base_p = NOISE_OFFSET_BASE + 2 * (
-                        k_abs[:, None] * O + out_cols[None, :]
-                    )
-                    noise_base_n = noise_base_p + 1
-                    gp_abs = LGS + gp * Q_G
-                    gn_abs = LGS + gn * Q_G
-                    gp_shift = gp_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_p) * READ_SIGMA) - LGS
-                    gn_shift = gn_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_n) * READ_SIGMA) - LGS
-                    w = gp_shift - gn_shift
+                if USE_GDIFF:
+                    w = gp * Q_G
                 else:
-                    w = (gp - gn) * Q_G
+                    gn = tl.load(
+                        gn_idx + k_abs[:, None] * gn_s0 + out_cols[None, :] * gn_s1,
+                        mask=mask_k[:, None] & mask_l[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    if USE_READ_NOISE:
+                        noise_base_p = NOISE_OFFSET_BASE + 2 * (
+                            k_abs[:, None] * O + out_cols[None, :]
+                        )
+                        noise_base_n = noise_base_p + 1
+                        gp_abs = LGS + gp * Q_G
+                        gn_abs = LGS + gn * Q_G
+                        gp_shift = gp_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_p) * READ_SIGMA) - LGS
+                        gn_shift = gn_abs * tl.exp(tl.randn(NOISE_SEED, noise_base_n) * READ_SIGMA) - LGS
+                        w = gp_shift - gn_shift
+                    else:
+                        w = (gp - gn) * Q_G
                 if DOT_DTYPE == 1:
                     v = v.to(tl.float32).to(tl.float16)
                     w = w.to(tl.float32).to(tl.float16)
@@ -8435,7 +8443,7 @@ def triton_diff_input_accumulate_2d_from_slices_gidx_direct_final(
 def triton_mode1_gidx_direct_final(
     x: torch.Tensor,
     gp_idx: torch.Tensor,
-    gn_idx: torch.Tensor,
+    gn_idx: torch.Tensor | None,
     w_scale: torch.Tensor,
     *,
     x_max: float | torch.Tensor,
@@ -8457,6 +8465,7 @@ def triton_mode1_gidx_direct_final(
     block_l: int = 16,
     block_k: int = 64,
     input_tile_group: int = 1,
+    use_gdiff: bool = False,
 ) -> torch.Tensor:
     """Run mode-1 compressed differential-pair VMM directly into final output.
 
@@ -8469,7 +8478,12 @@ def triton_mode1_gidx_direct_final(
         raise RuntimeError(f"Triton fast accumulate is unavailable: {TRITON_IMPORT_ERROR}")
     if x.dim() != 2:
         raise ValueError("Mode-1 direct-final kernel expects a 2-D input tensor.")
-    if gp_idx.dim() != 2 or gn_idx.dim() != 2 or gp_idx.shape != gn_idx.shape:
+    if gp_idx.dim() != 2:
+        raise ValueError("Mode-1 direct-final kernel expects a 2-D conductance index tensor.")
+    if use_gdiff:
+        if read_sigma and read_sigma > 0.0:
+            raise ValueError("Mode-1 signed-difference indices do not support independent read variation.")
+    elif gn_idx is None or gn_idx.dim() != 2 or gp_idx.shape != gn_idx.shape:
         raise ValueError("Mode-1 direct-final kernel expects matching 2-D gp/gn index tensors.")
     if w_scale.dim() != 2:
         raise ValueError("Mode-1 direct-final kernel expects a 2-D tile scale grid.")
@@ -8484,7 +8498,7 @@ def triton_mode1_gidx_direct_final(
 
     x0 = _mode1_kernel_operand(x)
     gp = _mode1_kernel_operand(gp_idx)
-    gn = _mode1_kernel_operand(gn_idx)
+    gn = gp if use_gdiff else _mode1_kernel_operand(gn_idx)
     ws = _mode1_kernel_operand(w_scale)
     if torch.is_tensor(x_max):
         xmax = x_max.detach().to(device=x0.device, dtype=torch.float32).reshape(()).contiguous()
@@ -8562,6 +8576,7 @@ def triton_mode1_gidx_direct_final(
             input_precision,
             dot_dtype,
             use_read_noise,
+            bool(use_gdiff),
             bool(use_atomic),
             int(block_r),
             int(block_l),
@@ -8613,6 +8628,7 @@ def triton_mode1_gidx_direct_final(
         input_precision,
         dot_dtype,
         use_read_noise,
+        bool(use_gdiff),
         int(block_r),
         int(block_l),
         int(block_k),
@@ -8622,6 +8638,60 @@ def triton_mode1_gidx_direct_final(
         num_warps=4,
     )
     return out
+
+
+def triton_mode1_gdiff_direct_final(
+    x: torch.Tensor,
+    gdiff_idx: torch.Tensor,
+    w_scale: torch.Tensor,
+    *,
+    x_max: float | torch.Tensor,
+    lgs: float,
+    q_g: float,
+    read_sigma: float,
+    adc_ref_unit: float,
+    rdac: int,
+    radc: int,
+    vread: float,
+    g_level: int,
+    tile_in: int,
+    tile_out: int,
+    noise_seed: int = 12345,
+    noise_offset_base: int = 0,
+    input_precision: str = "ieee",
+    dot_dtype_override: int | None = None,
+    block_r: int = 32,
+    block_l: int = 16,
+    block_k: int = 64,
+    input_tile_group: int = 1,
+) -> torch.Tensor:
+    """Run Mode-1 direct-final from one signed differential level tensor."""
+    return triton_mode1_gidx_direct_final(
+        x,
+        gdiff_idx,
+        None,
+        w_scale,
+        x_max=x_max,
+        lgs=lgs,
+        q_g=q_g,
+        read_sigma=read_sigma,
+        adc_ref_unit=adc_ref_unit,
+        rdac=rdac,
+        radc=radc,
+        vread=vread,
+        g_level=g_level,
+        tile_in=tile_in,
+        tile_out=tile_out,
+        noise_seed=noise_seed,
+        noise_offset_base=noise_offset_base,
+        input_precision=input_precision,
+        dot_dtype_override=dot_dtype_override,
+        block_r=block_r,
+        block_l=block_l,
+        block_k=block_k,
+        input_tile_group=input_tile_group,
+        use_gdiff=True,
+    )
 
 
 def triton_gidx_accumulate_2d_input_slices(

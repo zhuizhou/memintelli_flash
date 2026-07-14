@@ -35,6 +35,7 @@ def build_mode1_engine(
     dtype: torch.dtype,
     require_fastpath: bool,
     input_tile_group: int = 1,
+    use_gdiff: bool = True,
 ) -> DPETensorMultiMode:
     return DPETensorMultiMode(
         HGS=1e-5,
@@ -55,6 +56,7 @@ def build_mode1_engine(
         triton_input_precision="ieee",
         triton_auto_config=True,
         triton_mode1_gidx_direct_final=True,
+        triton_mode1_gdiff_direct_final=bool(use_gdiff),
         triton_mode1_chunked_direct_final=True,
         triton_mode1_input_tile_group=int(input_tile_group),
         mode1_grouped_tile_gemm=False,
@@ -92,6 +94,9 @@ def compare_mode1_outputs(
     expected_f = expected.detach().to(torch.float32)
     diff = (actual_f - expected_f).abs()
     rel = diff / expected_f.abs().clamp_min(1e-12)
+    expected_l2 = torch.linalg.vector_norm(expected_f)
+    relative_l2 = torch.linalg.vector_norm(actual_f - expected_f) / expected_l2.clamp_min(1e-12)
+    equal_fraction = (actual_f == expected_f).to(torch.float32).mean()
     cosine = F.cosine_similarity(
         actual_f.reshape(1, -1),
         expected_f.reshape(1, -1),
@@ -101,6 +106,8 @@ def compare_mode1_outputs(
         "max_abs": float(diff.max().item()),
         "mean_abs": float(diff.mean().item()),
         "max_rel": float(rel.max().item()),
+        "relative_l2": float(relative_l2.item()),
+        "equal_fraction": float(equal_fraction.item()),
         "cosine_similarity": float(cosine),
         "torch_equal": bool(torch.equal(actual_f, expected_f)),
         "allclose_rtol1e_2_atol1e_2": bool(
@@ -108,6 +115,20 @@ def compare_mode1_outputs(
         ),
         "finite": bool(torch.isfinite(actual_f).all() and torch.isfinite(expected_f).all()),
     }
+
+
+def mode1_weight_state_bytes(weight: SlicedDataMultiMode) -> int:
+    def tensor_bytes(value) -> int:
+        if torch.is_tensor(value):
+            return int(value.numel() * value.element_size())
+        if isinstance(value, (tuple, list)):
+            return sum(tensor_bytes(item) for item in value)
+        return 0
+
+    return sum(
+        tensor_bytes(getattr(weight, name, None))
+        for name in ("G", "G_indices", "mode1_gdiff_indices", "mode1_w_max")
+    )
 
 
 @torch.no_grad()
@@ -132,6 +153,7 @@ def run_mode1_comparison(
         dtype=dtype,
         require_fastpath=True,
         input_tile_group=input_tile_group,
+        use_gdiff=True,
     )
     reference = build_mode1_engine(
         device,
@@ -140,6 +162,7 @@ def run_mode1_comparison(
         dtype=dtype,
         require_fastpath=False,
         input_tile_group=input_tile_group,
+        use_gdiff=True,
     )
     x_sliced = prepare_mode1_tensor(optimized, x, is_weight=False)
     weight_sliced = prepare_mode1_tensor(optimized, weight, is_weight=True)
@@ -202,7 +225,11 @@ def parse_shape(value: str) -> tuple[int, int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mode1 differential-pair microbenchmark")
     parser.add_argument("--shape", type=parse_shape, default=NAMED_SHAPES["qkv"])
-    parser.add_argument("--path", choices=["reference", "pair-direct", "both"], default="both")
+    parser.add_argument(
+        "--path",
+        choices=["reference", "pair-direct", "gdiff-direct", "both", "all"],
+        default="all",
+    )
     parser.add_argument("--read-var", type=float, default=0.0)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="cuda")
@@ -219,16 +246,31 @@ def main() -> None:
     x = torch.randn((tokens, in_features), device=device, dtype=dtype)
     weight = torch.randn((in_features, out_features), device=device, dtype=dtype)
 
-    preparation_engine = build_mode1_engine(
+    pair_preparation_engine = build_mode1_engine(
         device,
         backend="triton_gidx",
         read_var=args.read_var,
         dtype=dtype,
         require_fastpath=False,
         input_tile_group=args.input_tile_group,
+        use_gdiff=False,
     )
-    x_sliced = prepare_mode1_tensor(preparation_engine, x, is_weight=False)
-    weight_sliced = prepare_mode1_tensor(preparation_engine, weight, is_weight=True)
+    pair_x_sliced = prepare_mode1_tensor(pair_preparation_engine, x, is_weight=False)
+    pair_weight_sliced = prepare_mode1_tensor(pair_preparation_engine, weight, is_weight=True)
+    gdiff_x_sliced = None
+    gdiff_weight_sliced = None
+    if args.path in ("gdiff-direct", "all"):
+        gdiff_preparation_engine = build_mode1_engine(
+            device,
+            backend="triton_gidx",
+            read_var=args.read_var,
+            dtype=dtype,
+            require_fastpath=False,
+            input_tile_group=args.input_tile_group,
+            use_gdiff=True,
+        )
+        gdiff_x_sliced = prepare_mode1_tensor(gdiff_preparation_engine, x, is_weight=False)
+        gdiff_weight_sliced = prepare_mode1_tensor(gdiff_preparation_engine, weight, is_weight=True)
 
     result = {
         "shape": [tokens, in_features, out_features],
@@ -237,8 +279,16 @@ def main() -> None:
         "warmup": int(args.warmup),
         "repeat": int(args.repeat),
         "paths": {},
+        "weight_state_bytes": {
+            "pair": mode1_weight_state_bytes(pair_weight_sliced),
+            "gdiff": (
+                mode1_weight_state_bytes(gdiff_weight_sliced)
+                if gdiff_weight_sliced is not None
+                else None
+            ),
+        },
     }
-    if args.path in ("reference", "both"):
+    if args.path in ("reference", "both", "all"):
         reference = build_mode1_engine(
             device,
             backend="torch",
@@ -246,15 +296,16 @@ def main() -> None:
             dtype=dtype,
             require_fastpath=False,
             input_tile_group=args.input_tile_group,
+            use_gdiff=False,
         )
         result["paths"]["reference"] = benchmark_path(
             reference,
-            x_sliced,
-            weight_sliced,
+            pair_x_sliced,
+            pair_weight_sliced,
             warmup=args.warmup,
             repeat=args.repeat,
         )
-    if args.path in ("pair-direct", "both"):
+    if args.path in ("pair-direct", "both", "all"):
         optimized = build_mode1_engine(
             device,
             backend="triton_gidx",
@@ -262,11 +313,29 @@ def main() -> None:
             dtype=dtype,
             require_fastpath=True,
             input_tile_group=args.input_tile_group,
+            use_gdiff=False,
         )
         result["paths"]["pair_direct"] = benchmark_path(
             optimized,
-            x_sliced,
-            weight_sliced,
+            pair_x_sliced,
+            pair_weight_sliced,
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
+    if args.path in ("gdiff-direct", "all"):
+        optimized_gdiff = build_mode1_engine(
+            device,
+            backend="triton_gidx",
+            read_var=args.read_var,
+            dtype=dtype,
+            require_fastpath=True,
+            input_tile_group=args.input_tile_group,
+            use_gdiff=True,
+        )
+        result["paths"]["gdiff_direct"] = benchmark_path(
+            optimized_gdiff,
+            gdiff_x_sliced,
+            gdiff_weight_sliced,
             warmup=args.warmup,
             repeat=args.repeat,
         )
@@ -274,6 +343,16 @@ def main() -> None:
         result["speedup"] = (
             result["paths"]["reference"]["mean_ms"]
             / result["paths"]["pair_direct"]["mean_ms"]
+        )
+    if "pair_direct" in result["paths"] and "gdiff_direct" in result["paths"]:
+        result["gdiff_over_pair_speedup"] = (
+            result["paths"]["pair_direct"]["mean_ms"]
+            / result["paths"]["gdiff_direct"]["mean_ms"]
+        )
+    if "reference" in result["paths"] and "gdiff_direct" in result["paths"]:
+        result["gdiff_over_reference_speedup"] = (
+            result["paths"]["reference"]["mean_ms"]
+            / result["paths"]["gdiff_direct"]["mean_ms"]
         )
 
     payload = json.dumps(result, indent=2)

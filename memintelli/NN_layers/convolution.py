@@ -16,7 +16,7 @@ from memintelli.NN_layers.functions import conv1d_mem_func, conv2d_mem_func
 from memintelli.pimpy import DPETensor
 
 
-_STREAM_ATTRS = ('G_indices', 'G', 'max_data', 'e_bias', 'mode1_w_max')
+_STREAM_ATTRS = ('G_indices', 'mode1_gdiff_indices', 'G', 'max_data', 'e_bias', 'mode1_w_max')
 
 
 def _make_sliced_data(engine, slice_method, *, device, bw_e, is_weight, paral_size, quant_gran, inference=False):
