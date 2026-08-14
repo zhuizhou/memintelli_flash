@@ -1,4 +1,5 @@
 import argparse
+import ast
 import importlib.util
 from pathlib import Path
 from unittest import mock
@@ -15,9 +16,27 @@ def load_benchmark_module():
     return module
 
 
-def s2_args(stage):
+def load_worker_namespace(module):
+    tree = ast.parse(module.WORKER_CODE)
+    required = {"s2_requires_exact_reduce", "apply_worker_s2_stage"}
+    tree.body = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in required
+    ]
+    namespace = {
+        "__name__": "stage_control_worker_test",
+        "__file__": str(BENCHMARK),
+    }
+    exec(compile(tree, str(BENCHMARK), "exec"), namespace)
+    return namespace
+
+
+def s2_args(stage, *, read_variation=0.0, semantic_policy="auto"):
     return argparse.Namespace(
         s2_stage=stage,
+        read_variation=read_variation,
+        mode0_semantic_policy=semantic_policy,
         fuse_mlp_gate_up=True,
         fuse_common_input_projections=True,
         triton_fuse_restored_input_slices=True,
@@ -29,6 +48,9 @@ def s2_args(stage):
         triton_fast_adc_scale=True,
         triton_direct_output_zero_once=True,
         triton_activation_slice_cache=True,
+        triton_fuse_activation_slices=True,
+        triton_gidx_fused_restore_read_noise=True,
+        direct_output_chunk_write=True,
     )
 
 
@@ -43,6 +65,9 @@ def test_s2_off_disables_both_execution_compaction_levels():
     assert args.fuse_mlp_gate_up is False
     assert args.fuse_common_input_projections is False
     assert args.triton_activation_slice_cache is False
+    assert args.triton_fuse_activation_slices is False
+    assert args.triton_gidx_fused_restore_read_noise is False
+    assert args.direct_output_chunk_write is False
 
 
 def test_s2_intra_enables_strict_intra_linear_compaction_only():
@@ -57,6 +82,9 @@ def test_s2_intra_enables_strict_intra_linear_compaction_only():
     assert args.fuse_mlp_gate_up is False
     assert args.fuse_common_input_projections is False
     assert args.triton_activation_slice_cache is False
+    assert args.triton_fuse_activation_slices is True
+    assert args.triton_gidx_fused_restore_read_noise is True
+    assert args.direct_output_chunk_write is True
 
 
 def test_s2_full_adds_common_input_projection_coalescing():
@@ -69,6 +97,140 @@ def test_s2_full_adds_common_input_projection_coalescing():
     assert args.fuse_mlp_gate_up is True
     assert args.fuse_common_input_projections is True
     assert args.triton_activation_slice_cache is False
+
+
+def test_s2_full_disables_projection_coalescing_under_finite_resident_budget():
+    module = load_benchmark_module()
+    args = s2_args("full")
+    args.state_resident_budget_mb = 24576.0
+
+    args, fast_inference = module.apply_s2_stage(args)
+
+    assert fast_inference is True
+    assert args.fuse_mlp_gate_up is False
+    assert args.fuse_common_input_projections is False
+
+
+def test_s2_full_allows_explicit_projection_override_under_finite_budget():
+    module = load_benchmark_module()
+    args = s2_args("full")
+    args.state_resident_budget_mb = 24576.0
+    args.fuse_mlp_gate_up = True
+    args.fuse_common_input_projections = True
+    args._fuse_mlp_gate_up_user_set = True
+    args._fuse_common_input_projections_user_set = True
+
+    args, fast_inference = module.apply_s2_stage(args)
+
+    assert fast_inference is True
+    assert args.fuse_mlp_gate_up is True
+    assert args.fuse_common_input_projections is True
+
+
+def test_s2_full_honors_explicit_projection_coalescing_overrides():
+    module = load_benchmark_module()
+    args = s2_args("full")
+    args.fuse_mlp_gate_up = True
+    args.fuse_common_input_projections = False
+    args._fuse_mlp_gate_up_user_set = True
+    args._fuse_common_input_projections_user_set = True
+
+    args, fast_inference = module.apply_s2_stage(args)
+
+    assert fast_inference is True
+    assert args.fuse_mlp_gate_up is True
+    assert args.fuse_common_input_projections is False
+
+
+def test_s2_noisy_auto_policy_uses_high_performance_direct_final():
+    module = load_benchmark_module()
+    args, fast_inference = module.apply_s2_stage(
+        s2_args("full", read_variation=0.05)
+    )
+
+    assert fast_inference is True
+    assert args.triton_direct_final_output is True
+    assert args.triton_direct_final_exact_reduce is False
+
+
+def test_s2_explicit_strict_policy_can_force_exact_noisy_diagnostics():
+    module = load_benchmark_module()
+    args, fast_inference = module.apply_s2_stage(
+        s2_args("full", read_variation=0.05, semantic_policy="strict")
+    )
+
+    assert fast_inference is True
+    assert args.triton_direct_final_exact_reduce is True
+
+
+def test_s2_explicit_fast_policy_skips_exact_reduce_for_clean_runs():
+    module = load_benchmark_module()
+    args, fast_inference = module.apply_s2_stage(
+        s2_args("full", read_variation=0.0, semantic_policy="fast")
+    )
+
+    assert fast_inference is True
+    assert args.triton_direct_final_exact_reduce is False
+
+
+def test_s2_launcher_honors_explicit_performance_overrides():
+    module = load_benchmark_module()
+    args = s2_args("intra", read_variation=0.05)
+    args.triton_overlap_restore_direct = True
+    args.triton_precompute_input_voltage = True
+    args.triton_fast_adc_scale = True
+    args.triton_direct_output_zero_once = True
+    args._triton_overlap_restore_direct_user_set = True
+    args._triton_precompute_input_voltage_user_set = True
+    args._triton_fast_adc_scale_user_set = True
+    args._triton_direct_output_zero_once_user_set = True
+    args._triton_gidx_direct_final_output_user_set = True
+
+    args, fast_inference = module.apply_s2_stage(args)
+
+    assert fast_inference is True
+    assert args.triton_overlap_restore_direct is True
+    assert args.triton_precompute_input_voltage is True
+    assert args.triton_fast_adc_scale is True
+    assert args.triton_direct_output_zero_once is True
+    assert args.triton_gidx_direct_final_output is True
+
+
+def test_s2_worker_honors_explicit_performance_overrides():
+    module = load_benchmark_module()
+    worker = load_worker_namespace(module)
+    args = s2_args("intra", read_variation=0.05)
+    args.fast_inference_backend = "triton_gidx"
+    args.triton_overlap_restore_direct = True
+    args.triton_precompute_input_voltage = True
+    args.triton_fast_adc_scale = True
+    args.triton_direct_output_zero_once = True
+    args._triton_overlap_restore_direct_user_set = True
+    args._triton_precompute_input_voltage_user_set = True
+    args._triton_fast_adc_scale_user_set = True
+    args._triton_direct_output_zero_once_user_set = True
+    args._triton_gidx_direct_final_output_user_set = True
+
+    args = worker["apply_worker_s2_stage"](args)
+
+    assert args.triton_overlap_restore_direct is True
+    assert args.triton_precompute_input_voltage is True
+    assert args.triton_fast_adc_scale is True
+    assert args.triton_direct_output_zero_once is True
+    assert args.triton_gidx_direct_final_output is True
+
+
+def test_s2_worker_disables_projection_coalescing_under_finite_budget():
+    module = load_benchmark_module()
+    worker = load_worker_namespace(module)
+    args = s2_args("full")
+    args.fast_inference_backend = "triton_gidx"
+    args.state_resident_budget_mb = 24576.0
+
+    args = worker["apply_worker_s2_stage"](args)
+
+    assert args.fuse_mlp_gate_up is False
+    assert args.fuse_common_input_projections is False
 
 
 def test_s1_stages_form_resident_block_budgeted_hierarchy():
@@ -206,3 +368,95 @@ def test_launcher_parser_exposes_independent_s1_s2_controls():
     assert args.inference_chunk_size == 16 * 1024 * 1024
     assert args.fuse_mlp_gate_up is False
     assert args.fuse_common_input_projections is False
+
+
+def test_launcher_parser_preserves_explicit_s2_performance_switches():
+    module = load_benchmark_module()
+    argv = [
+        "benchmark",
+        "--model-path",
+        "dummy-model",
+        "--s2-stage",
+        "intra",
+        "--read-variation",
+        "0.05",
+        "--triton-overlap-restore-direct",
+        "--triton-precompute-input-voltage",
+        "--triton-fast-adc-scale",
+        "--triton-direct-output-zero-once",
+        "--triton-gidx-direct-final-output",
+        "--no-include-hf",
+        "--no-include-original",
+        "--no-include-v2",
+        "--include-v3-mode0",
+    ]
+    with mock.patch("sys.argv", argv):
+        args = module.parse_args()
+
+    assert args.triton_overlap_restore_direct is True
+    assert args.triton_precompute_input_voltage is True
+    assert args.triton_fast_adc_scale is True
+    assert args.triton_direct_output_zero_once is True
+    assert args.triton_gidx_direct_final_output is True
+
+
+class FakeLinear:
+    def __init__(self, *, streaming):
+        self._streaming = streaming
+        self._next_streaming_layer = object()
+
+
+class FakeModel:
+    def __init__(self, layers):
+        self._layers = list(layers)
+
+    def modules(self):
+        yield self
+        yield from self._layers
+
+
+def test_streaming_prefetch_chain_follows_observed_execution_order():
+    from memintelli.NN_layers.streaming_prefetch import configure_from_execution_trace
+
+    first = FakeLinear(streaming=True)
+    resident = FakeLinear(streaming=False)
+    second = FakeLinear(streaming=True)
+    never_executed = FakeLinear(streaming=True)
+    model = FakeModel([never_executed, second, resident, first])
+
+    info = configure_from_execution_trace(
+        model,
+        FakeLinear,
+        [first, resident, second],
+    )
+
+    assert first._next_streaming_layer is second
+    assert second._next_streaming_layer is None
+    assert never_executed._next_streaming_layer is None
+    assert resident._next_streaming_layer is None
+    assert info == {
+        "enabled": True,
+        "trace_length": 3,
+        "streaming_layers": 2,
+        "links": 1,
+        "max_prefetch_window": 1,
+    }
+
+
+def test_streaming_prefetch_chain_deduplicates_reused_layers():
+    from memintelli.NN_layers.streaming_prefetch import configure_from_execution_trace
+
+    first = FakeLinear(streaming=True)
+    second = FakeLinear(streaming=True)
+    model = FakeModel([first, second])
+
+    info = configure_from_execution_trace(
+        model,
+        FakeLinear,
+        [first, second, first, second],
+    )
+
+    assert first._next_streaming_layer is second
+    assert second._next_streaming_layer is None
+    assert info["streaming_layers"] == 2
+    assert info["links"] == 1

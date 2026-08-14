@@ -21,6 +21,22 @@ from memintelli.pimpy.utils import SNR
 _STREAM_ATTRS = ('G_indices', 'G', 'max_data', 'e_bias', 'mode1_w_max')
 
 
+def _input_chunk_max_positions(engine, *, in_features, total_positions):
+    input_chunk_size = getattr(engine, "inference_input_chunk_size", None)
+    if input_chunk_size is not None and int(input_chunk_size) <= 0:
+        return int(total_positions)
+    chunk_budget = (
+        int(input_chunk_size)
+        if input_chunk_size is not None
+        else int(getattr(engine, "inference_chunk_size", None) or 32 * 1024 * 1024)
+    )
+    expansion_factor = 8
+    return min(
+        int(total_positions),
+        max(1, chunk_budget // max(1, int(in_features) * expansion_factor)),
+    )
+
+
 def _make_sliced_data(engine, slice_method, *, device, bw_e, is_weight, paral_size, quant_gran, inference=False):
     mode = getattr(engine, "mode", 0)
     if mode in (1, 2):
@@ -147,7 +163,8 @@ class LinearMem(nn.Module):
 
     def __init__(self, engine, in_features: int, out_features: int, input_slice:[list, tuple], weight_slice:[list, tuple],
                  bias: bool = True, device=None, dtype=torch.float32, bw_e=None, input_paral_size=(1, 32), weight_paral_size=(32, 32), 
-                 input_quant_gran=(1, 32), weight_quant_gran=(32, 32), skip_initial_mapping=False):
+                 input_quant_gran=(1, 32), weight_quant_gran=(32, 32), skip_initial_mapping=False,
+                 triton_output_chunk_limit_override=0):
         '''
         :param in_features: the input neuron number
         :param out_features: the output neuron number
@@ -183,6 +200,9 @@ class LinearMem(nn.Module):
             is_weight=True,
             paral_size=weight_paral_size,
             quant_gran=weight_quant_gran,
+        )
+        self.weight_sliced.triton_output_chunk_limit_override = max(
+            0, int(triton_output_chunk_limit_override or 0)
         )
         self.engine = engine
         if not skip_initial_mapping:
@@ -490,9 +510,11 @@ class LinearMem(nn.Module):
 
         # Input-dimension chunking to bound peak memory during slice_data_imp().
         # This complements engine-side matmul chunking (which chunks along weight cols).
-        chunk_budget = getattr(self.engine, 'inference_chunk_size', None) or 32 * 1024 * 1024
-        expansion_factor = 8  # conservative estimate for slicing intermediates
-        max_positions = max(1, chunk_budget // max(1, in_features * expansion_factor))
+        max_positions = _input_chunk_max_positions(
+            self.engine,
+            in_features=in_features,
+            total_positions=input_2d.shape[0],
+        )
         if getattr(self.engine, "mode", 0) == 1:
             # Mode 1 uses a per-forward signed-DAC activation scale. Splitting
             # rows would change that scale and therefore change the simulated ADC.

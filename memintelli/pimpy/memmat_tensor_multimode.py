@@ -9,6 +9,53 @@ try:
 except ImportError:
     from data_formats_multimode import SlicedDataMultiMode
 
+
+_INDEX_CAST_INT32_LIMIT = torch.iinfo(torch.int32).max
+
+
+def _compressed_index_cast_needs_segmentation(tensor):
+    if tensor.numel() == 0:
+        return False
+    max_relative_offset = sum(
+        max(0, int(size) - 1) * abs(int(stride))
+        for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return max_relative_offset > _INDEX_CAST_INT32_LIMIT
+
+
+def _cast_compressed_index_chunk(tensor, dtype):
+    if not _compressed_index_cast_needs_segmentation(tensor):
+        return tensor.to(dtype)
+
+    if tensor.is_cuda and tensor.dim() == 5:
+        from .triton_fast_accumulate import triton_restore_gidx_read_noise
+
+        return triton_restore_gidx_read_noise(
+            tensor,
+            lgs=0.0,
+            q_g=1.0,
+            read_sigma=0.0,
+            dtype=dtype,
+            strided=True,
+            m_slab=True,
+        )
+
+    contributions = [
+        max(0, int(size) - 1) * abs(int(stride))
+        for size, stride in zip(tensor.shape, tensor.stride())
+    ]
+    split_dim = max(range(tensor.dim()), key=contributions.__getitem__)
+    if contributions[split_dim] == 0:
+        return tensor.to(dtype)
+
+    output = torch.empty(tensor.shape, device=tensor.device, dtype=dtype)
+    for index in range(int(tensor.shape[split_dim])):
+        output.select(split_dim, index).copy_(
+            _cast_compressed_index_chunk(tensor.select(split_dim, index), dtype)
+        )
+    return output
+
+
 class DPETensorMultiMode(object):
     """Memory-efficient multi-mode dot product engine."""
 
@@ -28,6 +75,7 @@ class DPETensorMultiMode(object):
         mode1_paral_size=(64, 64),
         mode1_adc_per_tile=True,
         inference_chunk_size=None,
+        inference_input_chunk_size=None,
         fast_inference=False,
         fast_inference_backend="torch",
         triton_input_precision="ieee",
@@ -125,6 +173,8 @@ class DPETensorMultiMode(object):
             mode1_adc_per_tile (bool): If True, quantize Mode 1 current per input tile; otherwise quantize after accumulation
                 only when the full input dimension fits in one Mode 1 tile.
             inference_chunk_size (int or None): Optional number of output tile columns processed per inference chunk.
+            inference_input_chunk_size (int or None): Optional activation-slicing element budget. Zero disables
+                token/row chunking. None preserves the legacy coupling to inference_chunk_size.
             fast_inference (bool): If True, fuse all weight slices for each input slice in the inference path
                 when a scalar ADC is used. This reduces small-kernel launch overhead at the cost of a larger
                 per-chunk intermediate tensor.
@@ -282,12 +332,11 @@ class DPETensorMultiMode(object):
                 "auto" currently aliases "input". Explicit float dtypes force
                 the returned Linear output dtype and are useful for diagnostics
                 such as FP32-state + low-precision V/G dot runs.
-            mode0_semantic_policy (str): "auto" keeps mode-0 Triton speed
-                kernels only for clean, unseeded speed runs and uses the
-                torch-order semantic path for fixed-seed or noisy analog
-                audits. "strict" always disables mode-0 Triton semantic-risk
-                kernels. "fast" leaves the speed kernels enabled for explicit
-                approximate-speed experiments.
+            mode0_semantic_policy (str): "auto" uses the normal mode-0 Triton
+                execution path regardless of whether the read-noise stream is
+                seeded. "strict" explicitly selects the torch-order diagnostic
+                audit path. "fast" is retained as an explicit speed-policy
+                alias for older experiment manifests.
             mode0_vmm_compute_dtype (str or torch.dtype): Mode-0 voltage and
                 conductance operand dtype for VMM/einsum. "auto" follows
                 compute_dtype even when analog variation is enabled; ADC,
@@ -360,6 +409,7 @@ class DPETensorMultiMode(object):
         self.mode1_adc_per_tile = mode1_adc_per_tile
         self.mode1_paral_size = mode1_paral_size
         self.inference_chunk_size = inference_chunk_size
+        self.inference_input_chunk_size = inference_input_chunk_size
         self.fast_inference = fast_inference
         if fast_inference_backend not in ("torch", "triton", "triton_gidx"):
             raise ValueError("fast_inference_backend must be 'torch', 'triton', or 'triton_gidx'.")
@@ -565,11 +615,7 @@ class DPETensorMultiMode(object):
         if self.mode != 0:
             return False
         policy = getattr(self, "mode0_semantic_policy", "auto")
-        if policy == "fast":
-            return False
-        if policy == "strict":
-            return True
-        return self.read_variation_seed is not None
+        return policy == "strict"
 
     def _mode0_seeded_semantic_audit(self) -> bool:
         return self._mode0_strict_semantic_path()
@@ -1235,6 +1281,9 @@ class DPETensorMultiMode(object):
         return block_r, block_l, block_k, plan["shape_key"], input_tile_group
 
     def _mode0_triton_chunk_limit(self, ndc_y, mat=None, x=None):
+        per_weight_limit = int(getattr(mat, "triton_output_chunk_limit_override", 0) or 0)
+        if per_weight_limit > 0:
+            return min(max(1, int(ndc_y)), per_weight_limit)
         limit = max(1, int(getattr(self, "triton_output_chunk_limit", 256)))
         if not (self.triton_auto_config and self.mode == 0):
             return limit
@@ -2322,7 +2371,10 @@ class DPETensorMultiMode(object):
             except Exception:
                 pass
 
-        G_chunk = idx_chunk.to(self._mode0_restore_compute_dtype())
+        G_chunk = _cast_compressed_index_chunk(
+            idx_chunk,
+            self._mode0_restore_compute_dtype(),
+        )
         G_chunk.mul_(self.Q_G)
         if self._write_variation_is_virtual() or self._has_read_noise:
             G_chunk.add_(self.LGS)
@@ -2405,8 +2457,8 @@ class DPETensorMultiMode(object):
         if getattr(mat, "G_indices", None) is None or getattr(mat.G_indices, "dim", lambda: 0)() != 5:
             return None
         total = int(mat.G_indices.numel())
-        base = int(self._read_noise_forward_offset_counter) * total
-        self._read_noise_forward_offset_counter += 1
+        base = int(self._read_noise_forward_offset_counter)
+        self._read_noise_forward_offset_counter += total
         return base
 
     def _can_schedule_mode0_restore_input_prefetch(self, input_2d, mat: SlicedDataMultiMode) -> bool:
@@ -2426,7 +2478,6 @@ class DPETensorMultiMode(object):
             and self._has_read_noise
             and self._rv_all_same
             and self._rv_sigma > 0
-            and self.read_variation_seed is None
             and bool(getattr(self, "triton_gidx_fused_restore_read_noise", False))
             and not bool(getattr(self, "triton_gidx_read_noise", False))
             and not self._write_variation_is_virtual()
@@ -2492,9 +2543,6 @@ class DPETensorMultiMode(object):
         prefetch_source="input",
     ):
         """Prefetch the first restored mode-0 conductance chunk while input slicing runs."""
-        if self.read_variation_seed is not None:
-            self._fastpath_count("overlap_restore_input_skip_seeded_count")
-            return False
         if not self._can_schedule_mode0_restore_input_prefetch(input_2d, mat):
             return False
         chunks = list(self._iter_output_chunks(mat, x=None))
@@ -2733,35 +2781,29 @@ class DPETensorMultiMode(object):
         chunk_ndc = ndc_y
         if self.inference_chunk_size is not None:
             chunk_ndc = max(1, min(int(self.inference_chunk_size), ndc_y))
-        if (
-            self.fast_inference_backend in ("triton", "triton_gidx")
-            and not (
-                self.mode == 0
-                and self.read_variation_seed is not None
-            )
-        ):
-            # Very wide LLM heads can make the flattened Triton pointer offsets
-            # exceed the 32-bit range when all output tile columns are launched
-            # at once. Keep compressed-index launches bounded; the surrounding
-            # code concatenates chunks back into the same logical output.
-            g_source = None
-            if self.mode in (1, 2) and isinstance(getattr(mat, "G_indices", None), tuple):
-                g_source = mat.G_indices[0]
-            elif getattr(mat, "G_indices", None) is not None:
-                g_source = mat.G_indices
-            elif self.mode == 2 and isinstance(getattr(mat, "G", None), tuple):
-                g_source = mat.G[0]
-            elif getattr(mat, "G", None) is not None:
-                g_source = mat.G
-            if g_source is not None and len(g_source.shape) == 5:
-                m_dim, _, s_dim, k_dim, l_dim = [max(1, int(v)) for v in g_source.shape]
-                per_m_tile = max(1, s_dim * k_dim * l_dim)
-                max_by_offset = max(1, 2_000_000_000 // max(1, m_dim * per_m_tile))
+        # Compressed 5-D conductance state may still use the Triton restore
+        # kernel when the surrounding semantic loop is the PyTorch baseline.
+        # Apply its address-safety cap independently of the compute backend.
+        g_source = None
+        if self.mode in (1, 2) and isinstance(getattr(mat, "G_indices", None), tuple):
+            g_source = mat.G_indices[0]
+        elif getattr(mat, "G_indices", None) is not None:
+            g_source = mat.G_indices
+        elif self.mode == 2 and isinstance(getattr(mat, "G", None), tuple):
+            g_source = mat.G[0]
+        elif getattr(mat, "G", None) is not None:
+            g_source = mat.G
+        if g_source is not None and len(g_source.shape) == 5:
+            m_dim, _, s_dim, k_dim, l_dim = [max(1, int(v)) for v in g_source.shape]
+            per_m_tile = max(1, s_dim * k_dim * l_dim)
+            max_by_offset = max(1, 2_000_000_000 // max(1, m_dim * per_m_tile))
+            chunk_ndc = max(1, min(chunk_ndc, ndc_y, max_by_offset))
+            if self.fast_inference_backend in ("triton", "triton_gidx"):
                 chunk_limit = self._mode0_triton_chunk_limit(ndc_y, mat=mat, x=x)
-                chunk_ndc = max(1, min(chunk_ndc, ndc_y, max_by_offset, chunk_limit))
-            elif self.mode == 1:
-                chunk_limit = self._mode1_triton_chunk_limit(ndc_y, mat=mat)
-                chunk_ndc = max(1, min(chunk_ndc, ndc_y, chunk_limit))
+                chunk_ndc = max(1, min(chunk_ndc, chunk_limit))
+        elif self.mode == 1 and self.fast_inference_backend in ("triton", "triton_gidx"):
+            chunk_limit = self._mode1_triton_chunk_limit(ndc_y, mat=mat)
+            chunk_ndc = max(1, min(chunk_ndc, ndc_y, chunk_limit))
         for c0 in range(0, ndc_y, chunk_ndc):
             yield c0, min(c0 + chunk_ndc, ndc_y)
 

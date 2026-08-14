@@ -38,9 +38,23 @@ def _resolve_dot_dtype(default_dot_dtype: int, dot_dtype_override: int | None = 
     return dot_dtype
 
 
+def _normalize_runtime_noise_address(noise_seed: int, noise_offset_base: int) -> tuple[int, int]:
+    return int(noise_seed) & 0xFFFFFFFF, int(noise_offset_base) & 0x7FFFFFFFFFFFFFFF
+
+
+def _seeded_runtime_noise_offset(noise_seed: int, noise_offset_base: int) -> int:
+    """Map independent run seeds to well-separated 63-bit counter streams."""
+    mask64 = 0xFFFFFFFFFFFFFFFF
+    value = (int(noise_seed) + 0x9E3779B97F4A7C15) & mask64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask64
+    value ^= value >> 31
+    return (value + int(noise_offset_base)) & 0x7FFFFFFFFFFFFFFF
+
+
 if tl is not None:
     @triton.jit
-    def _hash_uniform01(counter, seed: tl.constexpr, salt: tl.constexpr):
+    def _hash_uniform01(counter, seed, salt: tl.constexpr):
         x = (counter + salt).to(tl.uint32) ^ seed
         x = x ^ (x >> 16)
         x = x * 2246822519
@@ -51,7 +65,7 @@ if tl is not None:
 
 
     @triton.jit
-    def _fast_normal3(counter, seed: tl.constexpr):
+    def _fast_normal3(counter, seed):
         u0 = _hash_uniform01(counter, seed, 0)
         u1 = _hash_uniform01(counter, seed, 1013904223)
         u2 = _hash_uniform01(counter, seed, 2027808446)
@@ -770,7 +784,7 @@ if triton is not None:
         LGS: tl.constexpr,
         Q_G: tl.constexpr,
         READ_SIGMA: tl.constexpr,
-        NOISE_SEED: tl.constexpr,
+        NOISE_SEED,
         USE_READ_NOISE: tl.constexpr,
         APPROX_LINEAR_NOISE: tl.constexpr,
         USE_EXP2_NOISE: tl.constexpr,
@@ -788,10 +802,11 @@ if triton is not None:
         else:
             g_abs = LGS + idx_f * Q_G
         if USE_READ_NOISE:
+            noise_counter = noise_offset_base + offs.to(tl.int64)
             if FAST_NOISE:
-                noise = _fast_normal3(noise_offset_base + offs, NOISE_SEED)
+                noise = _fast_normal3(noise_counter, NOISE_SEED)
             else:
-                noise = tl.randn(NOISE_SEED, noise_offset_base + offs)
+                noise = tl.randn(NOISE_SEED, noise_counter)
             if APPROX_LINEAR_NOISE:
                 shifted = g_abs * (1.0 + noise * READ_SIGMA) - LGS
             elif USE_EXP2_NOISE:
@@ -825,7 +840,7 @@ if triton is not None:
         LGS: tl.constexpr,
         Q_G: tl.constexpr,
         READ_SIGMA: tl.constexpr,
-        NOISE_SEED: tl.constexpr,
+        NOISE_SEED,
         USE_READ_NOISE: tl.constexpr,
         APPROX_LINEAR_NOISE: tl.constexpr,
         USE_EXP2_NOISE: tl.constexpr,
@@ -861,10 +876,11 @@ if triton is not None:
         else:
             g_abs = LGS + idx_f * Q_G
         if USE_READ_NOISE:
+            noise_counter = noise_offset_base + offs.to(tl.int64)
             if FAST_NOISE:
-                noise = _fast_normal3(noise_offset_base + offs, NOISE_SEED)
+                noise = _fast_normal3(noise_counter, NOISE_SEED)
             else:
-                noise = tl.randn(NOISE_SEED, noise_offset_base + offs)
+                noise = tl.randn(NOISE_SEED, noise_counter)
             if APPROX_LINEAR_NOISE:
                 shifted = g_abs * (1.0 + noise * READ_SIGMA) - LGS
             elif USE_EXP2_NOISE:
@@ -891,7 +907,7 @@ if triton is not None:
         LGS: tl.constexpr,
         Q_G: tl.constexpr,
         READ_SIGMA: tl.constexpr,
-        NOISE_SEED: tl.constexpr,
+        NOISE_SEED,
         USE_READ_NOISE: tl.constexpr,
         APPROX_LINEAR_NOISE: tl.constexpr,
         USE_EXP2_NOISE: tl.constexpr,
@@ -913,10 +929,11 @@ if triton is not None:
         else:
             g_abs = LGS + idx_f * Q_G
         if USE_READ_NOISE:
+            noise_counter = noise_offset_base + offs.to(tl.int64)
             if FAST_NOISE:
-                noise = _fast_normal3(noise_offset_base + offs, NOISE_SEED)
+                noise = _fast_normal3(noise_counter, NOISE_SEED)
             else:
-                noise = tl.randn(NOISE_SEED, noise_offset_base + offs)
+                noise = tl.randn(NOISE_SEED, noise_counter)
             if APPROX_LINEAR_NOISE:
                 shifted = g_abs * (1.0 + noise * READ_SIGMA) - LGS
             elif USE_EXP2_NOISE:
@@ -950,7 +967,7 @@ if triton is not None:
         LGS: tl.constexpr,
         Q_G: tl.constexpr,
         READ_SIGMA: tl.constexpr,
-        NOISE_SEED: tl.constexpr,
+        NOISE_SEED,
         USE_READ_NOISE: tl.constexpr,
         APPROX_LINEAR_NOISE: tl.constexpr,
         USE_EXP2_NOISE: tl.constexpr,
@@ -984,10 +1001,11 @@ if triton is not None:
         # canonical [M,P,S,K,L] logical order, even though output is [M,P,K,S,L].
         canonical = (((m * P + p) * S + s) * K + k) * L + l
         if USE_READ_NOISE:
+            noise_counter = noise_offset_base + canonical.to(tl.int64)
             if FAST_NOISE:
-                noise = _fast_normal3(noise_offset_base + canonical, NOISE_SEED)
+                noise = _fast_normal3(noise_counter, NOISE_SEED)
             else:
-                noise = tl.randn(NOISE_SEED, noise_offset_base + canonical)
+                noise = tl.randn(NOISE_SEED, noise_counter)
             if APPROX_LINEAR_NOISE:
                 shifted = g_abs * (1.0 + noise * READ_SIGMA) - LGS
             elif USE_EXP2_NOISE:
@@ -7078,6 +7096,10 @@ def triton_strict_adc_scale_accumulate(
     return accumulated
 
 
+def _should_use_strided_gidx_restore(idx, strided):
+    return bool(strided and idx.dim() == 5)
+
+
 def triton_restore_gidx_read_noise(
     idx: torch.Tensor,
     *,
@@ -7102,17 +7124,12 @@ def triton_restore_gidx_read_noise(
     if not idx.is_cuda:
         raise ValueError("Triton G-index restore requires a CUDA tensor.")
     use_read_noise = bool(read_sigma and read_sigma > 0.0)
-    # NOISE_SEED is a Triton constexpr, so per-run random seeds would create
-    # extra specializations and can surface as delayed JIT stalls. Keep the
-    # compiled seed fixed and fold the requested seed into the runtime offset.
-    compile_noise_seed = 12345
-    runtime_noise_offset_base = int(noise_offset_base)
-    if use_read_noise:
-        runtime_noise_offset_base = (
-            runtime_noise_offset_base + ((int(noise_seed) & 0x7FFFFFFF) % 65521) * 131071
-        ) & 0x7FFFFFFF
+    runtime_noise_seed, runtime_noise_offset_base = _normalize_runtime_noise_address(
+        noise_seed,
+        noise_offset_base,
+    )
 
-    if strided and (not idx.is_contiguous()) and idx.dim() == 5:
+    if _should_use_strided_gidx_restore(idx, strided):
         out = torch.empty(idx.shape, device=idx.device, dtype=dtype)
         total = idx.numel()
         grid = (triton.cdiv(total, block),)
@@ -7131,7 +7148,7 @@ def triton_restore_gidx_read_noise(
                 float(lgs),
                 float(q_g),
                 float(read_sigma),
-                compile_noise_seed,
+                runtime_noise_seed,
                 use_read_noise,
                 bool(approx_linear_noise),
                 bool(exp2_noise),
@@ -7159,7 +7176,7 @@ def triton_restore_gidx_read_noise(
             float(lgs),
             float(q_g),
             float(read_sigma),
-            compile_noise_seed,
+            runtime_noise_seed,
             use_read_noise,
             bool(approx_linear_noise),
             bool(exp2_noise),
@@ -7182,7 +7199,7 @@ def triton_restore_gidx_read_noise(
         float(lgs),
         float(q_g),
         float(read_sigma),
-        compile_noise_seed,
+        runtime_noise_seed,
         use_read_noise,
         bool(approx_linear_noise),
         bool(exp2_noise),
@@ -8485,9 +8502,10 @@ def triton_mode1_gidx_direct_final(
     compile_noise_seed = 12345
     runtime_noise_offset_base = int(noise_offset_base)
     if use_read_noise:
-        runtime_noise_offset_base = (
-            runtime_noise_offset_base + ((int(noise_seed) & 0x7FFFFFFF) % 65521) * 131071
-        ) & 0x7FFFFFFF
+        runtime_noise_offset_base = _seeded_runtime_noise_offset(
+            noise_seed,
+            runtime_noise_offset_base,
+        )
 
     num_r_blocks = triton.cdiv(rows, block_r)
     num_l_blocks = triton.cdiv(tile_out, block_l)
@@ -8914,9 +8932,10 @@ def triton_gidx_accumulate_2d_input_slices_direct_final(
     compile_noise_seed = 12345
     runtime_noise_offset_base = int(noise_offset_base)
     if read_sigma and read_sigma > 0.0:
-        runtime_noise_offset_base = (
-            runtime_noise_offset_base + ((int(noise_seed) & 0x7FFFFFFF) % 65521) * 131071
-        ) & 0x7FFFFFFF
+        runtime_noise_offset_base = _seeded_runtime_noise_offset(
+            noise_seed,
+            runtime_noise_offset_base,
+        )
     if bool(deterministic_m_reduce):
         if read_sigma and read_sigma > 0.0:
             raise ValueError("deterministic_m_reduce currently supports read_sigma=0 only.")

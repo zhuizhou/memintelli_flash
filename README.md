@@ -4,10 +4,58 @@
 
 _Memintelli_ is an open source Python-based framework, that provides an important priori guidance for hardware design in the field of general-purpose in-memory computing. 
 
+## Memintelli-Flash v3
+
+The `v3` branch contains the LLM-oriented fine-grained bit-serial CIM execution path. It keeps per-slice VMM, ADC quantization, slice-significance accumulation, array reduction, and read-variation modeling while addressing two practical GPU limits:
+
+- budget-aware, block-addressable simulation state for wide Linear layers;
+- compact Triton execution for the intra-Linear tile and slice loops.
+
+The main entry point is [`examples/20_real_llm_prefill_benchmark.py`](./examples/20_real_llm_prefill_benchmark.py). It supports full Hugging Face Linear replacement, including `lm_head`, and exposes independent state and compute controls through `--s1-stage` and `--s2-stage`.
+
+### Additional requirements
+
+Install a CUDA-compatible PyTorch build first. The LLM benchmark additionally requires `transformers` and Triton. Triton support depends on the selected PyTorch/CUDA platform.
+
+```bash
+pip install -e .
+pip install transformers accelerate safetensors
+```
+
+### LLM prefill example
+
+The following command runs the v3 mode-0 path with five 1-bit input slices, five 1-bit weight slices, BF16 VMM operands, FP32 ADC/reduction, and 5% read variation:
+
+```bash
+python examples/20_real_llm_prefill_benchmark.py \
+  --model-path /path/to/model \
+  --include-v3-mode0 \
+  --no-include-hf \
+  --simulate-lm-head \
+  --execution-mode speed \
+  --s1-stage budgeted \
+  --s2-stage intra \
+  --batch 1 \
+  --seq 128 \
+  --warmup 1 \
+  --repeat 10 \
+  --input-slice 1 1 1 1 1 \
+  --weight-slice 1 1 1 1 1 \
+  --rdac 2 \
+  --radc 256 \
+  --read-variation 0.05 \
+  --conductance-dtype bfloat16 \
+  --compute-dtype bfloat16 \
+  --mode0-vmm-compute-dtype bfloat16 \
+  --json-out result.json
+```
+
+For a capacity-constrained run, set `--execution-mode balanced` together with `--cuda-peak-budget-mb` and `--state-resident-budget-mb`. Use `--s2-stage off` only for the framework-loop reference path or ablation.
+
 ## Installation
 1. Get the tool from GitHub
 ```
-git clone https://github.com/HUST-ISMD-Odyssey/Memintelli.git
+git clone --branch v3 https://github.com/zhuizhou/memintelli_flash.git
 ```
 2. Install by 
 ```

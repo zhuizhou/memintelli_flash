@@ -45,6 +45,11 @@ try:
 except ImportError:
     GenericOutputBlockedLinearMem = None
 
+try:
+    from memintelli.NN_layers.streaming_prefetch import configure_from_execution_trace as _configure_streaming_prefetch
+except ImportError:
+    _configure_streaming_prefetch = None
+
 
 def sync(device):
     if device.type == "cuda":
@@ -77,6 +82,33 @@ def config_vocab_size(config):
     if vocab is None and hasattr(config, "text_config"):
         vocab = getattr(config.text_config, "vocab_size", None)
     return int(vocab or 32000)
+
+
+def load_fixed_input_batch(path, *, device, expected_batch, expected_seq, vocab_size):
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict) or "input_ids" not in payload:
+        raise ValueError("--input-batch-json must contain an input_ids field")
+    input_ids = torch.as_tensor(payload["input_ids"], dtype=torch.long)
+    expected_shape = (int(expected_batch), int(expected_seq))
+    if input_ids.dim() != 2 or tuple(input_ids.shape) != expected_shape:
+        raise ValueError(
+            f"fixed input shape {tuple(input_ids.shape)} does not match requested shape {expected_shape}"
+        )
+    if input_ids.numel() and (int(input_ids.min()) < 0 or int(input_ids.max()) >= int(vocab_size)):
+        raise ValueError("fixed input contains token ids outside the model vocabulary")
+    mask_payload = payload.get("attention_mask")
+    if mask_payload is None:
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        attention_mask = torch.as_tensor(mask_payload, dtype=torch.long)
+        if tuple(attention_mask.shape) != expected_shape:
+            raise ValueError(
+                f"fixed attention-mask shape {tuple(attention_mask.shape)} does not match requested shape {expected_shape}"
+            )
+        if attention_mask.numel() and not bool(torch.all((attention_mask == 0) | (attention_mask == 1))):
+            raise ValueError("fixed attention mask must contain only 0 or 1")
+    return input_ids.to(device=device), attention_mask.to(device=device)
 
 
 ARC_EASY_SMOKE_EXAMPLES = [
@@ -1334,6 +1366,7 @@ def make_engine(args, device):
             mode=args.mode,
             mode2_input_mode=args.mode2_input_mode,
             inference_chunk_size=args.inference_chunk_size,
+            inference_input_chunk_size=args.inference_input_chunk_size,
             fast_inference=args.fast_inference,
             fast_inference_backend=args.fast_inference_backend,
             triton_input_precision=args.triton_input_precision,
@@ -1419,7 +1452,7 @@ def make_engine(args, device):
     return DPETensor(**kwargs)
 
 
-def linearmem_kwargs(LinearMem, args, engine, child, device, supports_skip):
+def linearmem_kwargs(LinearMem, args, engine, child, device, supports_skip, terminal_layer=False):
     input_slice = args.mode2_input_slice if args.kind == "v3" and args.mode == 2 else args.input_slice
     weight_slice = args.mode2_weight_slice if args.kind == "v3" and args.mode == 2 else args.weight_slice
     kwargs = dict(
@@ -1439,10 +1472,26 @@ def linearmem_kwargs(LinearMem, args, engine, child, device, supports_skip):
     )
     if supports_skip:
         kwargs["skip_initial_mapping"] = True
+    supports_terminal_chunk_override = (
+        LinearMem is None
+        or "triton_output_chunk_limit_override" in inspect.signature(LinearMem.__init__).parameters
+    )
+    if args.kind == "v3" and supports_terminal_chunk_override:
+        kwargs["triton_output_chunk_limit_override"] = (
+            resolve_linear_output_chunk_tiles(args, terminal_layer=True)
+            if bool(terminal_layer)
+            else 0
+        )
     return kwargs
 
 
-def plan_linear_output_blocks(args, child, manual_shard_count=0):
+def resolve_linear_output_chunk_tiles(args, terminal_layer=False):
+    default_limit = max(1, int(getattr(args, "triton_output_chunk_limit", 256) or 256))
+    terminal_limit = int(getattr(args, "triton_terminal_output_chunk_limit", 0) or 0)
+    return max(1, terminal_limit) if bool(terminal_layer) and terminal_limit > 0 else default_limit
+
+
+def plan_linear_output_blocks(args, child, manual_shard_count=0, terminal_layer=False):
     stage = str(getattr(args, "s1_stage", "off") or "off")
     block_addressable = bool(getattr(args, "s1_block_addressable", stage != "off"))
     if not block_addressable:
@@ -1454,6 +1503,8 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0):
             base_allocated_mb=0.0,
             resident_state_mb=0.0,
             safety_margin_mb=0.0,
+            preparation_peak_mb=0.0,
+            execution_peak_mb=0.0,
             manual_override=False,
         )
 
@@ -1477,7 +1528,26 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0):
     if vmm_dtype == "auto":
         vmm_dtype = str(getattr(args, "compute_dtype", "float32") or "float32")
     grouped_noisy_vmm = read_variation > 0.0 and vmm_dtype in {"float16", "bfloat16"}
-    return plan_output_block(
+    execution_strategy = "direct_final" if str(getattr(args, "s2_stage", "off")) != "off" else "framework"
+    output_chunk_tiles = resolve_linear_output_chunk_tiles(args, terminal_layer=terminal_layer)
+    streaming_prefetch_window = int(
+        not bool(terminal_layer)
+        and
+        bool(getattr(args, "streaming", False))
+        and bool(getattr(args, "streaming_prefetch", True))
+    )
+    g_level = max(2, int(getattr(args, "g_level", 16) or 16))
+    compressed_state_bytes = 1 if g_level <= 256 else 2 if g_level <= 65536 else 4
+    restored_conductance_bytes = (
+        2 if vmm_dtype in {"float16", "bfloat16"} else 4
+    ) if execution_strategy == "direct_final" else None
+    execution_window_cols = output_chunk_tiles * weight_tiles[1]
+    maximum_output_block_cols = (
+        execution_window_cols
+        if bool(terminal_layer) and planner_enabled and execution_strategy == "direct_final" and not manual_cols
+        else 0
+    )
+    plan = plan_output_block(
         tokens=max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
         in_features=int(child.in_features),
         out_features=int(child.out_features),
@@ -1493,7 +1563,131 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0):
         read_variation=read_variation,
         seeded_read_noise=getattr(args, "read_variation_seed", None) is not None,
         grouped_noisy_vmm=grouped_noisy_vmm,
+        execution_strategy=execution_strategy,
+        output_chunk_tiles=output_chunk_tiles,
+        streaming_prefetch_window=streaming_prefetch_window,
+        compressed_state_bytes=compressed_state_bytes,
+        restored_conductance_bytes=restored_conductance_bytes,
+        output_bytes=4 if execution_strategy == "direct_final" else 2,
+        minimum_output_block_cols=(
+            execution_window_cols
+            if execution_strategy == "direct_final"
+            else weight_tiles[1]
+        ),
+        maximum_output_block_cols=maximum_output_block_cols,
     )
+    return plan
+
+
+def plan_model_resident_budget(args, model):
+    import re
+    import torch.nn as nn
+
+    planner_enabled = str(getattr(args, "state_planner", "off")) == "analytical"
+    cuda_budget_mb = float(getattr(args, "cuda_peak_budget_mb", 0.0) or 0.0)
+    requested_mb = float(getattr(args, "state_resident_budget_mb", 0.0) or 0.0)
+    residency_policy = str(getattr(args, "planner_residency_policy", "auto") or "auto")
+    if residency_policy not in {"auto", "preserve_blocks", "honor_request"}:
+        raise ValueError(f"unsupported planner residency policy: {residency_policy}")
+    if (
+        not planner_enabled
+        or cuda_budget_mb <= 0.0
+        or requested_mb <= 0.0
+        or int(getattr(args, "output_block_cols", 0) or 0) > 0
+        or int(getattr(args, "lm_head_output_shards", 1) or 1) > 1
+    ):
+        return requested_mb
+
+    from memintelli.NN_layers.state_planner import (
+        plan_global_feasible_resident_budget,
+        plan_global_resident_budget,
+    )
+
+    weight_tiles = tuple(int(v) for v in getattr(args, "weight_paral_size", (64, 64)))
+    input_slices = max(1, len(getattr(args, "input_slice", (1,))))
+    weight_slices = max(1, len(getattr(args, "weight_slice", (1,))))
+    read_variation = float(getattr(args, "read_variation", 0.0) or 0.0)
+    vmm_dtype = str(getattr(args, "mode0_vmm_compute_dtype", "auto") or "auto")
+    if vmm_dtype == "auto":
+        vmm_dtype = str(getattr(args, "compute_dtype", "float32") or "float32")
+    execution_strategy = "direct_final" if str(getattr(args, "s2_stage", "off")) != "off" else "framework"
+    g_level = max(2, int(getattr(args, "g_level", 16) or 16))
+    compressed_state_bytes = 1 if g_level <= 256 else 2 if g_level <= 65536 else 4
+    restored_conductance_bytes = (
+        2 if vmm_dtype in {"float16", "bfloat16"} else 4
+    ) if execution_strategy == "direct_final" else None
+    layer_specs = []
+    for name, child in model.named_modules():
+        if not isinstance(child, nn.Linear):
+            continue
+        terminal_layer = name == "lm_head" or name.endswith(".lm_head")
+        output_chunk_tiles = resolve_linear_output_chunk_tiles(args, terminal_layer=terminal_layer)
+        if bool(getattr(args, "only_lm_head", False)) and not terminal_layer:
+            continue
+        if not bool(getattr(args, "simulate_lm_head", False)) and terminal_layer:
+            continue
+        include_patterns = list(getattr(args, "linear_include_regex", ()) or ())
+        exclude_patterns = list(getattr(args, "linear_exclude_regex", ()) or ())
+        always_include_head = terminal_layer and bool(getattr(args, "always_include_lm_head", False))
+        if include_patterns and not always_include_head and not any(re.search(pattern, name) for pattern in include_patterns):
+            continue
+        if exclude_patterns and any(re.search(pattern, name) for pattern in exclude_patterns):
+            continue
+        layer_specs.append(
+            {
+                "tokens": max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
+                "in_features": int(child.in_features),
+                "out_features": int(child.out_features),
+                "input_slices": input_slices,
+                "weight_slices": weight_slices,
+                "array_rows": weight_tiles[0],
+                "array_cols": weight_tiles[1],
+                "read_variation": read_variation,
+                "seeded_read_noise": getattr(args, "read_variation_seed", None) is not None,
+                "grouped_noisy_vmm": read_variation > 0.0 and vmm_dtype in {"float16", "bfloat16"},
+                "execution_strategy": execution_strategy,
+                "output_chunk_tiles": output_chunk_tiles,
+                "streaming_prefetch_window": int(
+                    not terminal_layer
+                    and bool(getattr(args, "streaming", False))
+                    and bool(getattr(args, "streaming_prefetch", True))
+                ),
+                "compressed_state_bytes": compressed_state_bytes,
+                "restored_conductance_bytes": restored_conductance_bytes,
+                "output_bytes": 4 if execution_strategy == "direct_final" else 2,
+                "minimum_output_block_cols": (
+                    output_chunk_tiles * weight_tiles[1]
+                    if execution_strategy == "direct_final"
+                    else weight_tiles[1]
+                ),
+                "maximum_output_block_cols": (
+                    output_chunk_tiles * weight_tiles[1]
+                    if terminal_layer and execution_strategy == "direct_final"
+                    else 0
+                ),
+            }
+        )
+    if residency_policy == "auto":
+        residency_policy = (
+            "preserve_blocks" if requested_mb >= cuda_budget_mb else "honor_request"
+        )
+    planner = (
+        plan_global_resident_budget
+        if residency_policy == "preserve_blocks"
+        else plan_global_feasible_resident_budget
+    )
+    selected_mb = planner(
+        layer_specs=layer_specs,
+        requested_resident_mb=requested_mb,
+        cuda_peak_budget_mb=cuda_budget_mb,
+        base_allocated_mb=max(0.0, float(getattr(args, "planner_base_allocated_mb", 0.0) or 0.0)),
+        safety_margin_mb=max(0.0, float(getattr(args, "planner_safety_margin_mb", 256.0) or 0.0)),
+    )
+    args.state_resident_budget_mb = float(selected_mb)
+    args.memory_resident_budget_mb = float(selected_mb)
+    args.planner_selected_resident_mb = float(selected_mb)
+    args.planner_selected_residency_policy = residency_policy
+    return float(selected_mb)
 
 
 class ShardedLinearMem(nn.Module):
@@ -1515,7 +1709,9 @@ class ShardedLinearMem(nn.Module):
             shard_device = shard_devices[len(self.shards) % len(shard_devices)]
             shard_engine = engine if shard_device == engine.device else make_engine(args, shard_device)
             build_device = torch.device("cpu") if supports_skip else shard_device
-            shard = LinearMem(**linearmem_kwargs(LinearMem, args, shard_engine, child, build_device, supports_skip))
+            shard = LinearMem(**linearmem_kwargs(
+                LinearMem, args, shard_engine, child, build_device, supports_skip, terminal_layer=True
+            ))
             shard.out_features = end - start
             shard.weight = nn.Parameter(torch.empty((end - start, child.in_features), device=build_device, dtype=child.weight.dtype))
             shard.register_parameter("bias", None)
@@ -1590,7 +1786,7 @@ class ShardedLinearMem(nn.Module):
         return self
 
 
-def build_output_blocked_linear(LinearMem, args, engine, child, supports_skip, plan):
+def build_output_blocked_linear(LinearMem, args, engine, child, supports_skip, plan, terminal_layer=False):
     if GenericOutputBlockedLinearMem is None:
         raise ImportError("v3 output-block execution requires memintelli.NN_layers.output_blocking")
     if child.bias is not None and int(getattr(args, "mode", 0)) != 0:
@@ -1617,6 +1813,7 @@ def build_output_blocked_linear(LinearMem, args, engine, child, supports_skip, p
                 block_spec,
                 build_device,
                 supports_skip,
+                terminal_layer=terminal_layer,
             )
         )
         blocks.append(block)
@@ -2190,11 +2387,6 @@ def can_fuse_common_input_projection_group(args, linears):
         return False
     if float(getattr(args, "write_variation", 0.0) or 0.0) != 0.0:
         return False
-    if (
-        float(getattr(args, "read_variation", 0.0) or 0.0) > 0.0
-        and getattr(args, "read_variation_seed", None) is not None
-    ):
-        return False
     if tuple(int(v) for v in getattr(args, "weight_quant_gran", ())) != tuple(
         int(v) for v in getattr(args, "weight_paral_size", ())
     ):
@@ -2241,24 +2433,7 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
             if not all(should_replace_linear(full_name, args) for full_name in full_names):
                 continue
             linears = [getattr(module, name) for name in names]
-            output_align = None
             can_fuse = can_fuse_common_input_projection_group(args, linears)
-            if (
-                not can_fuse
-                and fused_attr == "_memintelli_fused_linear_attn_qkv_z_b_a"
-                and args.kind == "v3"
-                and int(getattr(args, "mode", 0)) == 0
-                and float(getattr(args, "write_variation", 0.0) or 0.0) == 0.0
-                and tuple(int(v) for v in getattr(args, "weight_quant_gran", ())) == tuple(
-                    int(v) for v in getattr(args, "weight_paral_size", ())
-                )
-                and (
-                    float(getattr(args, "read_variation", 0.0) or 0.0) <= 0.0
-                    or getattr(args, "read_variation_seed", None) is None
-                )
-            ):
-                output_align = projection_group_output_alignment(args)
-                can_fuse = True
             if not can_fuse:
                 continue
             extra_count = len(linears)
@@ -2282,7 +2457,7 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                 list(zip(names, linears)),
                 build_device,
                 supports_skip,
-                output_align=output_align,
+                output_align=None,
             )
             for index, name in enumerate(names):
                 setattr(module, name, FusedProjectionView(fused, index))
@@ -2366,7 +2541,9 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                 if child.bias is not None:
                     raise NotImplementedError("Reduced lm_head output currently supports bias=False only.")
                 reduced_child = nn.Linear(child.in_features, len(lm_head_output_token_ids), bias=False, device=build_device, dtype=child.weight.dtype)
-                new_layer = LinearMem(**linearmem_kwargs(LinearMem, args, engine, reduced_child, build_device, supports_skip))
+                new_layer = LinearMem(**linearmem_kwargs(
+                    LinearMem, args, engine, reduced_child, build_device, supports_skip, terminal_layer=True
+                ))
                 new_layer = SelectedOutputLinearMem(new_layer, lm_head_output_token_ids)
             else:
                 manual_shard_count = int(args.lm_head_output_shards) if is_head else 0
@@ -2374,6 +2551,7 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                     args,
                     child,
                     manual_shard_count=manual_shard_count,
+                    terminal_layer=is_head,
                 )
                 if output_block_plan.shard_count > 1:
                     new_layer = build_output_blocked_linear(
@@ -2383,8 +2561,15 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                         child,
                         supports_skip,
                         output_block_plan,
+                        terminal_layer=is_head,
                     )
                     state["output_blocked_linears"] += 1
+                else:
+                    new_layer = LinearMem(**linearmem_kwargs(
+                        LinearMem, args, engine, child, build_device, supports_skip, terminal_layer=is_head
+                    ))
+                    object.__setattr__(new_layer, "output_block_plan", output_block_plan)
+                if is_head or output_block_plan.shard_count > 1:
                     state["output_block_plans"].append(
                         {
                             "name": full_name,
@@ -2397,6 +2582,18 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                             "base_allocated_mb": float(output_block_plan.base_allocated_mb),
                             "resident_state_mb": float(output_block_plan.resident_state_mb),
                             "safety_margin_mb": float(output_block_plan.safety_margin_mb),
+                            "preparation_peak_mb": float(output_block_plan.preparation_peak_mb),
+                            "execution_peak_mb": float(output_block_plan.execution_peak_mb),
+                            "predicted_prepare_peak_mb": float(
+                                output_block_plan.preparation_peak_mb
+                                + output_block_plan.base_allocated_mb
+                                + output_block_plan.resident_state_mb
+                            ),
+                            "predicted_forward_peak_mb": float(
+                                output_block_plan.execution_peak_mb
+                                + output_block_plan.base_allocated_mb
+                                + output_block_plan.resident_state_mb
+                            ),
                             "predicted_total_peak_mb": float(
                                 output_block_plan.estimated_peak_mb
                                 + output_block_plan.base_allocated_mb
@@ -2405,8 +2602,6 @@ def replace_linear(module, LinearMem, args, engine, runtime_device, prefix="", s
                             "manual_override": bool(output_block_plan.manual_override),
                         }
                     )
-                else:
-                    new_layer = LinearMem(**linearmem_kwargs(LinearMem, args, engine, child, build_device, supports_skip))
             if is_head and args.lm_head_input_select == "last":
                 new_layer = LastTokenLinearMem(new_layer)
             with torch.no_grad():
@@ -2511,6 +2706,18 @@ def apply_worker_s1_stage(args):
     return args
 
 
+def s2_requires_exact_reduce(args, fast_inference):
+    if not fast_inference:
+        return False
+    policy = str(getattr(args, "mode0_semantic_policy", "auto") or "auto")
+    if policy == "strict":
+        return True
+    if policy == "fast":
+        return False
+    read_variation = float(getattr(args, "read_variation", 0.0) or 0.0)
+    return read_variation == 0.0
+
+
 def apply_worker_s2_stage(args):
     stage = getattr(args, "s2_stage", "full")
     if stage not in {"off", "intra", "full"}:
@@ -2519,14 +2726,26 @@ def apply_worker_s2_stage(args):
     args.fast_inference = fast_inference
     args.triton_fuse_restored_input_slices = fast_inference
     args.triton_direct_final_output = fast_inference
-    args.triton_gidx_direct_final_output = False
-    args.triton_direct_final_exact_reduce = fast_inference
-    args.triton_overlap_restore_direct = False
-    args.triton_precompute_input_voltage = False
-    args.triton_fast_adc_scale = False
-    args.triton_direct_output_zero_once = False
-    args.fuse_mlp_gate_up = stage == "full"
-    args.fuse_common_input_projections = stage == "full"
+    if not fast_inference or not bool(getattr(args, "_triton_gidx_direct_final_output_user_set", False)):
+        args.triton_gidx_direct_final_output = False
+    args.triton_direct_final_exact_reduce = s2_requires_exact_reduce(args, fast_inference)
+    if not fast_inference or not bool(getattr(args, "_triton_overlap_restore_direct_user_set", False)):
+        args.triton_overlap_restore_direct = False
+    if not fast_inference or not bool(getattr(args, "_triton_precompute_input_voltage_user_set", False)):
+        args.triton_precompute_input_voltage = False
+    if not fast_inference or not bool(getattr(args, "_triton_fast_adc_scale_user_set", False)):
+        args.triton_fast_adc_scale = False
+    if not fast_inference or not bool(getattr(args, "_triton_direct_output_zero_once_user_set", False)):
+        args.triton_direct_output_zero_once = False
+    args.triton_fuse_activation_slices = fast_inference
+    args.triton_gidx_fused_restore_read_noise = fast_inference
+    args.direct_output_chunk_write = fast_inference
+    resident_budget_mb = float(getattr(args, "state_resident_budget_mb", -1.0))
+    auto_coalesce = stage == "full" and resident_budget_mb < 0.0
+    if not bool(getattr(args, "_fuse_mlp_gate_up_user_set", False)):
+        args.fuse_mlp_gate_up = auto_coalesce
+    if not bool(getattr(args, "_fuse_common_input_projections_user_set", False)):
+        args.fuse_common_input_projections = auto_coalesce
     args.triton_activation_slice_cache = False
     if args.fast_inference_backend == "auto":
         args.fast_inference_backend = "triton_gidx" if fast_inference else "torch"
@@ -2705,6 +2924,42 @@ def configure_cross_restore_prefetch_from_execution_trace(model, LinearMem, trac
         "trace_length": len(trace),
         "unique_layers": len(unique_layers),
         "links": links,
+    }
+
+
+def configure_streaming_prefetch_from_execution_trace(model, LinearMem, trace):
+    if _configure_streaming_prefetch is not None:
+        return _configure_streaming_prefetch(model, LinearMem, trace)
+    empty = {
+        "enabled": False,
+        "trace_length": len(trace or []),
+        "streaming_layers": 0,
+        "links": 0,
+        "max_prefetch_window": 0,
+    }
+    if LinearMem is None or not trace:
+        return empty
+    mem_layers = {id(module): module for module in iter_mem_layers(model, LinearMem)}
+    streaming_layers = []
+    seen = set()
+    for module in trace:
+        module_id = id(module)
+        if module_id not in mem_layers or module_id in seen:
+            continue
+        seen.add(module_id)
+        if bool(getattr(module, "_streaming", False)):
+            streaming_layers.append(module)
+    for module in mem_layers.values():
+        object.__setattr__(module, "_next_streaming_layer", None)
+    for current, target in zip(streaming_layers, streaming_layers[1:]):
+        object.__setattr__(current, "_next_streaming_layer", target)
+    links = max(0, len(streaming_layers) - 1)
+    return {
+        "enabled": True,
+        "trace_length": len(trace),
+        "streaming_layers": len(streaming_layers),
+        "links": links,
+        "max_prefetch_window": 1 if links else 0,
     }
 
 
@@ -3073,7 +3328,8 @@ def prepare_mem_model(model, LinearMem, args, device):
     if supports_inference and args.streaming:
         streaming_sequence = [module for module in layers if bool(getattr(module, "_streaming", False))]
         streaming_layers = len(streaming_sequence)
-        if streaming_layers and bool(getattr(args, "streaming_prefetch", True)):
+        trace_configurable = hasattr(LinearMem, "begin_execution_trace") and hasattr(LinearMem, "end_execution_trace")
+        if streaming_layers and bool(getattr(args, "streaming_prefetch", True)) and not trace_configurable:
             prefetch_distance = max(1, int(getattr(args, "streaming_prefetch_distance", 1) or 1))
             for i in range(streaming_layers):
                 target = i + prefetch_distance
@@ -3189,6 +3445,7 @@ def main():
     parser.add_argument("--torch-compile-exclude-linearmem", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cuda-profiler-capture", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--workload", choices=["prefill", "classification", "generation"], default="prefill")
+    parser.add_argument("--input-batch-json", default="")
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--classification-task", choices=["token_proxy", "arc_easy_smoke", "multi_choice_json"], default="token_proxy")
     parser.add_argument("--classification-examples-json", default="")
@@ -3203,6 +3460,11 @@ def main():
     parser.add_argument("--s2-stage", choices=["off", "intra", "full"], default="full")
     parser.add_argument("--cuda-peak-budget-mb", type=float, default=0.0)
     parser.add_argument("--state-resident-budget-mb", type=float, default=0.0)
+    parser.add_argument(
+        "--planner-residency-policy",
+        choices=["auto", "preserve_blocks", "honor_request"],
+        default="auto",
+    )
     parser.add_argument("--output-block-cols", type=int, default=0)
     parser.add_argument("--memory-prepare-policy", choices=["lazy_release", "lazy_keep", "eager_streaming"], default="lazy_release")
     parser.add_argument("--memory-runtime-diagnostic", action=argparse.BooleanOptionalAction, default=False)
@@ -3232,6 +3494,7 @@ def main():
     parser.add_argument("--triton-block-l", type=int, default=16)
     parser.add_argument("--triton-block-k", type=int, default=64)
     parser.add_argument("--triton-output-chunk-limit", type=int, default=256)
+    parser.add_argument("--triton-terminal-output-chunk-limit", type=int, default=0)
     parser.add_argument("--triton-auto-config", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--triton-mode0-input-tile-group", type=int, default=1)
     parser.add_argument("--triton-gidx-read-noise", action=argparse.BooleanOptionalAction, default=False)
@@ -3334,11 +3597,40 @@ def main():
     parser.add_argument("--input-quant-gran", type=int, nargs=2, default=[1, 64])
     parser.add_argument("--weight-quant-gran", type=int, nargs=2, default=[64, 64])
     parser.add_argument("--inference-chunk-size", type=int, default=16 * 1024 * 1024)
+    parser.add_argument("--inference-input-chunk-size", type=int, default=0)
     parser.add_argument("--cuda-memory-fraction", type=float, default=0.0)
     parser.add_argument("--collect-layer-buffer-accounting", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--layer-buffer-accounting-limit", type=int, default=12)
     args = parser.parse_args()
     args = apply_vmm_lowp_format_defaults(args, argv_has_option=lambda opt: _worker_argv_has_option(raw_argv, opt))
+    args._fuse_mlp_gate_up_user_set = (
+        _worker_argv_has_option(raw_argv, "--fuse-mlp-gate-up")
+        or _worker_argv_has_option(raw_argv, "--no-fuse-mlp-gate-up")
+    )
+    args._fuse_common_input_projections_user_set = (
+        _worker_argv_has_option(raw_argv, "--fuse-common-input-projections")
+        or _worker_argv_has_option(raw_argv, "--no-fuse-common-input-projections")
+    )
+    args._triton_overlap_restore_direct_user_set = (
+        _worker_argv_has_option(raw_argv, "--triton-overlap-restore-direct")
+        or _worker_argv_has_option(raw_argv, "--no-triton-overlap-restore-direct")
+    )
+    args._triton_precompute_input_voltage_user_set = (
+        _worker_argv_has_option(raw_argv, "--triton-precompute-input-voltage")
+        or _worker_argv_has_option(raw_argv, "--no-triton-precompute-input-voltage")
+    )
+    args._triton_fast_adc_scale_user_set = (
+        _worker_argv_has_option(raw_argv, "--triton-fast-adc-scale")
+        or _worker_argv_has_option(raw_argv, "--no-triton-fast-adc-scale")
+    )
+    args._triton_direct_output_zero_once_user_set = (
+        _worker_argv_has_option(raw_argv, "--triton-direct-output-zero-once")
+        or _worker_argv_has_option(raw_argv, "--no-triton-direct-output-zero-once")
+    )
+    args._triton_gidx_direct_final_output_user_set = (
+        _worker_argv_has_option(raw_argv, "--triton-gidx-direct-final-output")
+        or _worker_argv_has_option(raw_argv, "--no-triton-gidx-direct-final-output")
+    )
     if args.kind == "v3" and args.vmm_lowp_format in VMM_LOWP_EXPERIMENTAL_8BIT:
         raise RuntimeError(unsupported_8bit_vmm_reason(args.vmm_lowp_format))
     lowp_sets_vmm_dtype = args.vmm_lowp_format in VMM_LOWP_STABLE_DTYPES
@@ -3408,6 +3700,7 @@ def main():
 
         engine = make_engine(args, device)
         args.planner_base_allocated_mb = estimate_non_linear_model_bytes(model) / (1024 ** 2)
+        plan_model_resident_budget(args, model)
         replace_state = {
             "replaced": 0,
             "replaced_names": [],
@@ -3480,9 +3773,19 @@ def main():
         "classification_prompt_count": 0,
         "classification_prompt_preview": [],
     }
+    if args.workload == "classification" and args.input_batch_json:
+        raise ValueError("--input-batch-json is only supported for prefill or generation workloads")
     if args.workload == "classification" and args.classification_task in {"arc_easy_smoke", "multi_choice_json"}:
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
         input_ids, attention_mask, classification_context = build_multi_choice_classification_batch(args, tokenizer, device)
+    elif args.input_batch_json:
+        input_ids, attention_mask = load_fixed_input_batch(
+            args.input_batch_json,
+            device=device,
+            expected_batch=args.batch,
+            expected_seq=args.seq,
+            vocab_size=vocab_size,
+        )
     else:
         input_ids = torch.randint(0, vocab_size, (args.batch, args.seq), device=device)
         attention_mask = torch.ones_like(input_ids)
@@ -3789,24 +4092,47 @@ def main():
         "unique_layers": 0,
         "links": 0,
     }
+    streaming_prefetch_trace_info = {
+        "enabled": False,
+        "trace_length": 0,
+        "streaming_layers": 0,
+        "links": 0,
+        "max_prefetch_window": 0,
+    }
     with torch.no_grad():
-        if (
+        trace_capable = (
             args.kind != "hf"
-            and bool(getattr(args, "triton_cross_linear_restore_prefetch", False))
             and LinearMem is not None
             and hasattr(LinearMem, "begin_execution_trace")
             and hasattr(LinearMem, "end_execution_trace")
-        ):
+        )
+        trace_streaming_prefetch = (
+            trace_capable
+            and bool(getattr(args, "streaming", False))
+            and bool(getattr(args, "streaming_prefetch", True))
+            and int(prep_info.get("streaming_layers", 0) or 0) > 0
+        )
+        trace_cross_restore = trace_capable and bool(
+            getattr(args, "triton_cross_linear_restore_prefetch", False)
+        )
+        if int(args.warmup) > 0 and (trace_streaming_prefetch or trace_cross_restore):
             LinearMem.begin_execution_trace()
             try:
                 _ = run_workload_once()
             finally:
                 trace = LinearMem.end_execution_trace()
-            cross_restore_trace_info = configure_cross_restore_prefetch_from_execution_trace(
-                model,
-                LinearMem,
-                trace,
-            )
+            if trace_streaming_prefetch:
+                streaming_prefetch_trace_info = configure_streaming_prefetch_from_execution_trace(
+                    model,
+                    LinearMem,
+                    trace,
+                )
+            if trace_cross_restore:
+                cross_restore_trace_info = configure_cross_restore_prefetch_from_execution_trace(
+                    model,
+                    LinearMem,
+                    trace,
+                )
             for _ in range(max(0, int(args.warmup) - 1)):
                 _ = run_workload_once()
         else:
@@ -3900,6 +4226,7 @@ def main():
         "batch": args.batch,
         "seq": args.seq,
         "workload": args.workload,
+        "input_batch_json": args.input_batch_json,
         "decode_steps": args.decode_steps if args.workload == "generation" else 0,
         "generation_token_ids": generation_state["token_ids"] if args.workload == "generation" else [],
         "generation_token_ids_by_step": generation_state["token_ids_by_step"] if args.workload == "generation" else [],
@@ -3930,6 +4257,9 @@ def main():
         "runtime_counters": bool(args.runtime_counters or args.runtime_stage_timing or args.memory_runtime_diagnostic or args.profile),
         "memory_budget_mb": float(getattr(args, "memory_budget_mb", 0.0) or 0.0),
         "memory_resident_budget_mb": float(args.memory_resident_budget_mb or 0.0),
+        "planner_residency_policy": getattr(args, "planner_residency_policy", "auto"),
+        "planner_selected_residency_policy": getattr(args, "planner_selected_residency_policy", None),
+        "planner_selected_resident_mb": getattr(args, "planner_selected_resident_mb", None),
         "memory_resident_select": args.memory_resident_select,
         "memory_resident_used_mb": prep_info.get("memory_resident_used_mb"),
         "memory_resident_layers": prep_info.get("memory_resident_layers"),
@@ -3986,11 +4316,15 @@ def main():
         "input_quant_gran": list(args.input_quant_gran) if args.kind in {"v2", "v3"} else [],
         "weight_quant_gran": list(args.weight_quant_gran) if args.kind in {"v2", "v3"} else [],
         "inference_chunk_size": int(args.inference_chunk_size) if args.kind in {"v2", "v3"} else None,
+        "inference_input_chunk_size": int(args.inference_input_chunk_size) if args.kind == "v3" else None,
         "triton_input_precision": args.triton_input_precision if args.kind == "v3" else "n/a",
         "triton_block_r": args.triton_block_r if args.kind == "v3" else None,
         "triton_block_l": args.triton_block_l if args.kind == "v3" else None,
         "triton_block_k": args.triton_block_k if args.kind == "v3" else None,
         "triton_output_chunk_limit": args.triton_output_chunk_limit if args.kind == "v3" else None,
+        "triton_terminal_output_chunk_limit": (
+            args.triton_terminal_output_chunk_limit if args.kind == "v3" else None
+        ),
         "triton_auto_config": bool(args.triton_auto_config) if args.kind == "v3" else False,
         "triton_mode0_input_tile_group": int(args.triton_mode0_input_tile_group) if args.kind == "v3" else 1,
         "triton_gidx_read_noise": bool(args.triton_gidx_read_noise) if args.kind == "v3" else False,
@@ -4110,6 +4444,11 @@ def main():
         "cross_restore_trace_length": int(cross_restore_trace_info.get("trace_length", 0) or 0),
         "cross_restore_trace_unique_layers": int(cross_restore_trace_info.get("unique_layers", 0) or 0),
         "cross_restore_trace_links": int(cross_restore_trace_info.get("links", 0) or 0),
+        "streaming_prefetch_trace_enabled": bool(streaming_prefetch_trace_info.get("enabled", False)),
+        "streaming_prefetch_trace_length": int(streaming_prefetch_trace_info.get("trace_length", 0) or 0),
+        "streaming_prefetch_trace_layers": int(streaming_prefetch_trace_info.get("streaming_layers", 0) or 0),
+        "streaming_prefetch_trace_links": int(streaming_prefetch_trace_info.get("links", 0) or 0),
+        "streaming_prefetch_max_window": int(streaming_prefetch_trace_info.get("max_prefetch_window", 0) or 0),
         "supports_inference": prep_info["supports_inference"],
         "g_storage_mb": prep_info["g_storage_mb"],
         "g_gpu_mb": prep_info["g_gpu_mb"],
@@ -4500,7 +4839,13 @@ def apply_launcher_execution_mode_defaults(args):
     return args
 
 
-def plan_linear_output_blocks(args, child, manual_shard_count=0):
+def resolve_linear_output_chunk_tiles(args, terminal_layer=False):
+    default_limit = max(1, int(getattr(args, "triton_output_chunk_limit", 256) or 256))
+    terminal_limit = int(getattr(args, "triton_terminal_output_chunk_limit", 0) or 0)
+    return max(1, terminal_limit) if bool(terminal_layer) and terminal_limit > 0 else default_limit
+
+
+def plan_linear_output_blocks(args, child, manual_shard_count=0, terminal_layer=False):
     stage = str(getattr(args, "s1_stage", "off") or "off")
     block_addressable = bool(getattr(args, "s1_block_addressable", stage != "off"))
     if not block_addressable:
@@ -4512,6 +4857,8 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0):
             base_allocated_mb=0.0,
             resident_state_mb=0.0,
             safety_margin_mb=0.0,
+            preparation_peak_mb=0.0,
+            execution_peak_mb=0.0,
             manual_override=False,
         )
 
@@ -4535,7 +4882,26 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0):
     if vmm_dtype == "auto":
         vmm_dtype = str(getattr(args, "compute_dtype", "float32") or "float32")
     grouped_noisy_vmm = read_variation > 0.0 and vmm_dtype in {"float16", "bfloat16"}
-    return plan_output_block(
+    execution_strategy = "direct_final" if str(getattr(args, "s2_stage", "off")) != "off" else "framework"
+    output_chunk_tiles = resolve_linear_output_chunk_tiles(args, terminal_layer=terminal_layer)
+    streaming_prefetch_window = int(
+        not bool(terminal_layer)
+        and
+        bool(getattr(args, "streaming", False))
+        and bool(getattr(args, "streaming_prefetch", True))
+    )
+    g_level = max(2, int(getattr(args, "g_level", 16) or 16))
+    compressed_state_bytes = 1 if g_level <= 256 else 2 if g_level <= 65536 else 4
+    restored_conductance_bytes = (
+        2 if vmm_dtype in {"float16", "bfloat16"} else 4
+    ) if execution_strategy == "direct_final" else None
+    execution_window_cols = output_chunk_tiles * weight_tiles[1]
+    maximum_output_block_cols = (
+        execution_window_cols
+        if bool(terminal_layer) and planner_enabled and execution_strategy == "direct_final" and not manual_cols
+        else 0
+    )
+    plan = plan_output_block(
         tokens=max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
         in_features=int(child.in_features),
         out_features=int(child.out_features),
@@ -4551,7 +4917,131 @@ def plan_linear_output_blocks(args, child, manual_shard_count=0):
         read_variation=read_variation,
         seeded_read_noise=getattr(args, "read_variation_seed", None) is not None,
         grouped_noisy_vmm=grouped_noisy_vmm,
+        execution_strategy=execution_strategy,
+        output_chunk_tiles=output_chunk_tiles,
+        streaming_prefetch_window=streaming_prefetch_window,
+        compressed_state_bytes=compressed_state_bytes,
+        restored_conductance_bytes=restored_conductance_bytes,
+        output_bytes=4 if execution_strategy == "direct_final" else 2,
+        minimum_output_block_cols=(
+            execution_window_cols
+            if execution_strategy == "direct_final"
+            else weight_tiles[1]
+        ),
+        maximum_output_block_cols=maximum_output_block_cols,
     )
+    return plan
+
+
+def plan_model_resident_budget(args, model):
+    import re
+    import torch.nn as nn
+
+    planner_enabled = str(getattr(args, "state_planner", "off")) == "analytical"
+    cuda_budget_mb = float(getattr(args, "cuda_peak_budget_mb", 0.0) or 0.0)
+    requested_mb = float(getattr(args, "state_resident_budget_mb", 0.0) or 0.0)
+    residency_policy = str(getattr(args, "planner_residency_policy", "auto") or "auto")
+    if residency_policy not in {"auto", "preserve_blocks", "honor_request"}:
+        raise ValueError(f"unsupported planner residency policy: {residency_policy}")
+    if (
+        not planner_enabled
+        or cuda_budget_mb <= 0.0
+        or requested_mb <= 0.0
+        or int(getattr(args, "output_block_cols", 0) or 0) > 0
+        or int(getattr(args, "lm_head_output_shards", 1) or 1) > 1
+    ):
+        return requested_mb
+
+    from memintelli.NN_layers.state_planner import (
+        plan_global_feasible_resident_budget,
+        plan_global_resident_budget,
+    )
+
+    weight_tiles = tuple(int(v) for v in getattr(args, "weight_paral_size", (64, 64)))
+    input_slices = max(1, len(getattr(args, "input_slice", (1,))))
+    weight_slices = max(1, len(getattr(args, "weight_slice", (1,))))
+    read_variation = float(getattr(args, "read_variation", 0.0) or 0.0)
+    vmm_dtype = str(getattr(args, "mode0_vmm_compute_dtype", "auto") or "auto")
+    if vmm_dtype == "auto":
+        vmm_dtype = str(getattr(args, "compute_dtype", "float32") or "float32")
+    execution_strategy = "direct_final" if str(getattr(args, "s2_stage", "off")) != "off" else "framework"
+    g_level = max(2, int(getattr(args, "g_level", 16) or 16))
+    compressed_state_bytes = 1 if g_level <= 256 else 2 if g_level <= 65536 else 4
+    restored_conductance_bytes = (
+        2 if vmm_dtype in {"float16", "bfloat16"} else 4
+    ) if execution_strategy == "direct_final" else None
+    layer_specs = []
+    for name, child in model.named_modules():
+        if not isinstance(child, nn.Linear):
+            continue
+        terminal_layer = name == "lm_head" or name.endswith(".lm_head")
+        output_chunk_tiles = resolve_linear_output_chunk_tiles(args, terminal_layer=terminal_layer)
+        if bool(getattr(args, "only_lm_head", False)) and not terminal_layer:
+            continue
+        if not bool(getattr(args, "simulate_lm_head", False)) and terminal_layer:
+            continue
+        include_patterns = list(getattr(args, "linear_include_regex", ()) or ())
+        exclude_patterns = list(getattr(args, "linear_exclude_regex", ()) or ())
+        always_include_head = terminal_layer and bool(getattr(args, "always_include_lm_head", False))
+        if include_patterns and not always_include_head and not any(re.search(pattern, name) for pattern in include_patterns):
+            continue
+        if exclude_patterns and any(re.search(pattern, name) for pattern in exclude_patterns):
+            continue
+        layer_specs.append(
+            {
+                "tokens": max(1, int(getattr(args, "batch", 1))) * max(1, int(getattr(args, "seq", 1))),
+                "in_features": int(child.in_features),
+                "out_features": int(child.out_features),
+                "input_slices": input_slices,
+                "weight_slices": weight_slices,
+                "array_rows": weight_tiles[0],
+                "array_cols": weight_tiles[1],
+                "read_variation": read_variation,
+                "seeded_read_noise": getattr(args, "read_variation_seed", None) is not None,
+                "grouped_noisy_vmm": read_variation > 0.0 and vmm_dtype in {"float16", "bfloat16"},
+                "execution_strategy": execution_strategy,
+                "output_chunk_tiles": output_chunk_tiles,
+                "streaming_prefetch_window": int(
+                    not terminal_layer
+                    and bool(getattr(args, "streaming", False))
+                    and bool(getattr(args, "streaming_prefetch", True))
+                ),
+                "compressed_state_bytes": compressed_state_bytes,
+                "restored_conductance_bytes": restored_conductance_bytes,
+                "output_bytes": 4 if execution_strategy == "direct_final" else 2,
+                "minimum_output_block_cols": (
+                    output_chunk_tiles * weight_tiles[1]
+                    if execution_strategy == "direct_final"
+                    else weight_tiles[1]
+                ),
+                "maximum_output_block_cols": (
+                    output_chunk_tiles * weight_tiles[1]
+                    if terminal_layer and execution_strategy == "direct_final"
+                    else 0
+                ),
+            }
+        )
+    if residency_policy == "auto":
+        residency_policy = (
+            "preserve_blocks" if requested_mb >= cuda_budget_mb else "honor_request"
+        )
+    planner = (
+        plan_global_resident_budget
+        if residency_policy == "preserve_blocks"
+        else plan_global_feasible_resident_budget
+    )
+    selected_mb = planner(
+        layer_specs=layer_specs,
+        requested_resident_mb=requested_mb,
+        cuda_peak_budget_mb=cuda_budget_mb,
+        base_allocated_mb=max(0.0, float(getattr(args, "planner_base_allocated_mb", 0.0) or 0.0)),
+        safety_margin_mb=max(0.0, float(getattr(args, "planner_safety_margin_mb", 256.0) or 0.0)),
+    )
+    args.state_resident_budget_mb = float(selected_mb)
+    args.memory_resident_budget_mb = float(selected_mb)
+    args.planner_selected_resident_mb = float(selected_mb)
+    args.planner_selected_residency_policy = residency_policy
+    return float(selected_mb)
 
 
 def apply_s1_stage(args):
@@ -4577,6 +5067,18 @@ def apply_s1_stage(args):
     return args
 
 
+def s2_requires_exact_reduce(args, fast_inference):
+    if not fast_inference:
+        return False
+    policy = str(getattr(args, "mode0_semantic_policy", "auto") or "auto")
+    if policy == "strict":
+        return True
+    if policy == "fast":
+        return False
+    read_variation = float(getattr(args, "read_variation", 0.0) or 0.0)
+    return read_variation == 0.0
+
+
 def apply_s2_stage(args):
     """Select intra-Linear and inter-Linear semantics-preserving compaction."""
     stage = getattr(args, "s2_stage", None)
@@ -4592,14 +5094,26 @@ def apply_s2_stage(args):
     fast_inference = stage != "off"
     args.triton_fuse_restored_input_slices = fast_inference
     args.triton_direct_final_output = fast_inference
-    args.triton_gidx_direct_final_output = False
-    args.triton_direct_final_exact_reduce = fast_inference
-    args.triton_overlap_restore_direct = False
-    args.triton_precompute_input_voltage = False
-    args.triton_fast_adc_scale = False
-    args.triton_direct_output_zero_once = False
-    args.fuse_mlp_gate_up = stage == "full"
-    args.fuse_common_input_projections = stage == "full"
+    if not fast_inference or not bool(getattr(args, "_triton_gidx_direct_final_output_user_set", False)):
+        args.triton_gidx_direct_final_output = False
+    args.triton_direct_final_exact_reduce = s2_requires_exact_reduce(args, fast_inference)
+    if not fast_inference or not bool(getattr(args, "_triton_overlap_restore_direct_user_set", False)):
+        args.triton_overlap_restore_direct = False
+    if not fast_inference or not bool(getattr(args, "_triton_precompute_input_voltage_user_set", False)):
+        args.triton_precompute_input_voltage = False
+    if not fast_inference or not bool(getattr(args, "_triton_fast_adc_scale_user_set", False)):
+        args.triton_fast_adc_scale = False
+    if not fast_inference or not bool(getattr(args, "_triton_direct_output_zero_once_user_set", False)):
+        args.triton_direct_output_zero_once = False
+    args.triton_fuse_activation_slices = fast_inference
+    args.triton_gidx_fused_restore_read_noise = fast_inference
+    args.direct_output_chunk_write = fast_inference
+    resident_budget_mb = float(getattr(args, "state_resident_budget_mb", -1.0))
+    auto_coalesce = stage == "full" and resident_budget_mb < 0.0
+    if not bool(getattr(args, "_fuse_mlp_gate_up_user_set", False)):
+        args.fuse_mlp_gate_up = auto_coalesce
+    if not bool(getattr(args, "_fuse_common_input_projections_user_set", False)):
+        args.fuse_common_input_projections = auto_coalesce
     args.triton_activation_slice_cache = False
     if getattr(args, "fast_inference_backend", "auto") == "auto":
         args.fast_inference_backend = "triton_gidx" if fast_inference else "torch"
@@ -4642,6 +5156,7 @@ def failure_row(
         "batch": args.batch,
         "seq": args.seq,
         "workload": args.workload,
+        "input_batch_json": args.input_batch_json,
         "decode_steps": args.decode_steps if args.workload == "generation" else 0,
         "generation_token_ids": [],
         "generation_token_ids_by_step": [],
@@ -4695,6 +5210,7 @@ def failure_row(
         "runtime_counters": bool(args.runtime_counters or args.runtime_stage_timing or args.memory_runtime_diagnostic or args.profile),
         "memory_budget_mb": float(getattr(args, "memory_budget_mb", 0.0) or 0.0),
         "memory_resident_budget_mb": float(getattr(args, "memory_resident_budget_mb", 0.0) or 0.0),
+        "planner_residency_policy": getattr(args, "planner_residency_policy", "auto"),
         "memory_resident_select": getattr(args, "memory_resident_select", "largest"),
         "streaming": bool(args.streaming) if kind != "hf" else False,
         "streaming_prefetch": bool(getattr(args, "streaming_prefetch", True)) if kind != "hf" else False,
@@ -4720,6 +5236,8 @@ def failure_row(
         "require_all_linears": bool(args.require_all_linears),
         "lazy_prepare": args.lazy_prepare,
         "lazy_release_after_forward": args.lazy_release_after_forward,
+        "s1_stage": getattr(args, "s1_stage", "off"),
+        "s2_stage": getattr(args, "s2_stage", "off"),
         "mode": mode,
         "mode2_input_mode": input_mode if kind == "v3" and mode == 2 else "n/a",
         "fast_inference": "--fast-inference" in extra if kind == "v3" else False,
@@ -4755,6 +5273,9 @@ def failure_row(
         "triton_block_l": args.triton_block_l if kind == "v3" else None,
         "triton_block_k": args.triton_block_k if kind == "v3" else None,
         "triton_output_chunk_limit": args.triton_output_chunk_limit if kind == "v3" else None,
+        "triton_terminal_output_chunk_limit": (
+            args.triton_terminal_output_chunk_limit if kind == "v3" else None
+        ),
         "triton_auto_config": bool(getattr(args, "triton_auto_config", False)) if kind == "v3" else False,
         "triton_mode0_input_tile_group": int(getattr(args, "triton_mode0_input_tile_group", 1)) if kind == "v3" else 1,
         "triton_gidx_read_noise": bool(args.triton_gidx_read_noise) if kind == "v3" else False,
@@ -4958,6 +5479,7 @@ def run_worker(args, repo: Path | None, label: str, kind: str, extra: list[str])
         "--memory-resident-budget-mb", str(args.memory_resident_budget_mb),
         "--memory-resident-select", args.memory_resident_select,
         "--inference-chunk-size", str(args.inference_chunk_size),
+        "--inference-input-chunk-size", str(args.inference_input_chunk_size),
         "--cuda-memory-fraction", str(args.cuda_memory_fraction),
         "--layer-buffer-accounting-limit", str(args.layer_buffer_accounting_limit),
         "--hgs", str(args.hgs),
@@ -4992,8 +5514,11 @@ def run_worker(args, repo: Path | None, label: str, kind: str, extra: list[str])
         "--triton-block-l", str(triton_block_l),
         "--triton-block-k", str(triton_block_k),
         "--triton-output-chunk-limit", str(triton_output_chunk_limit),
+        "--triton-terminal-output-chunk-limit", str(args.triton_terminal_output_chunk_limit),
         *extra,
     ]
+    if args.input_batch_json:
+        cmd.extend(["--input-batch-json", args.input_batch_json])
     cmd.append("--triton-auto-config" if args.triton_auto_config else "--no-triton-auto-config")
     cmd.extend(["--triton-mode0-input-tile-group", str(args.triton_mode0_input_tile_group)])
     cmd.append("--triton-gidx-read-noise" if args.triton_gidx_read_noise else "--no-triton-gidx-read-noise")
@@ -5093,6 +5618,7 @@ def run_worker(args, repo: Path | None, label: str, kind: str, extra: list[str])
     cmd.extend(["--s2-stage", args.s2_stage])
     cmd.extend(["--cuda-peak-budget-mb", str(args.cuda_peak_budget_mb)])
     cmd.extend(["--state-resident-budget-mb", str(args.state_resident_budget_mb)])
+    cmd.extend(["--planner-residency-policy", args.planner_residency_policy])
     cmd.extend(["--output-block-cols", str(args.output_block_cols)])
     if args.memory_runtime_diagnostic:
         cmd.append("--memory-runtime-diagnostic")
@@ -5468,6 +5994,7 @@ def parse_args():
     parser.add_argument("--torch-compile-exclude-linearmem", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cuda-profiler-capture", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--workload", choices=["prefill", "classification", "generation"], default="prefill")
+    parser.add_argument("--input-batch-json", default="")
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--classification-task", choices=["token_proxy", "arc_easy_smoke", "multi_choice_json"], default="token_proxy")
     parser.add_argument("--classification-examples-json", default="")
@@ -5484,6 +6011,11 @@ def parse_args():
     parser.add_argument("--s2-ablation-stage", choices=["off", "grouped", "intra", "full"], default=None)
     parser.add_argument("--cuda-peak-budget-mb", type=float, default=0.0)
     parser.add_argument("--state-resident-budget-mb", type=float, default=0.0)
+    parser.add_argument(
+        "--planner-residency-policy",
+        choices=["auto", "preserve_blocks", "honor_request"],
+        default="auto",
+    )
     parser.add_argument("--output-block-cols", type=int, default=0)
     parser.add_argument("--memory-prepare-policy", choices=["lazy_release", "lazy_keep", "eager_streaming"], default="lazy_release")
     parser.add_argument("--memory-runtime-diagnostic", action=argparse.BooleanOptionalAction, default=False)
@@ -5559,6 +6091,7 @@ def parse_args():
     parser.add_argument("--triton-block-l", type=int, default=16)
     parser.add_argument("--triton-block-k", type=int, default=64)
     parser.add_argument("--triton-output-chunk-limit", type=int, default=256)
+    parser.add_argument("--triton-terminal-output-chunk-limit", type=int, default=0)
     parser.add_argument("--triton-auto-config", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--triton-mode0-input-tile-group", type=int, default=1)
     parser.add_argument("--mode-aware-triton-defaults", action=argparse.BooleanOptionalAction, default=True)
@@ -5632,6 +6165,7 @@ def parse_args():
     parser.add_argument("--input-quant-gran", type=int, nargs=2, default=[1, 64])
     parser.add_argument("--weight-quant-gran", type=int, nargs=2, default=[64, 64])
     parser.add_argument("--inference-chunk-size", type=int, default=16 * 1024 * 1024)
+    parser.add_argument("--inference-input-chunk-size", type=int, default=0)
     parser.add_argument("--cuda-memory-fraction", type=float, default=0.0)
     parser.add_argument("--collect-layer-buffer-accounting", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--layer-buffer-accounting-limit", type=int, default=12)
